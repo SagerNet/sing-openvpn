@@ -1,0 +1,63 @@
+port {{ .Port }}
+proto {{ .Protocol }}
+dev tun
+topology subnet
+server 10.8.0.0 255.255.255.0
+ca {{ .CAPath }}
+cert {{ .CertPath }}
+key {{ .KeyPath }}
+dh none
+persist-key
+persist-tun
+verb 4
+{{- if .Cipher }}
+cipher {{ .Cipher }}
+{{- end }}
+{{- if .Auth }}
+auth {{ .Auth }}
+{{- end }}
+{{- if .DataCiphers }}
+{{ .DataCiphersDirective }} {{ .DataCiphers }}
+{{- end }}
+{{- if gt .TunMTU 0 }}
+tun-mtu {{ .TunMTU }}
+{{- end }}
+{{- if gt .Fragment 0 }}
+fragment {{ .Fragment }}
+{{- end }}
+{{- if gt .MSSFix 0 }}
+mssfix {{ .MSSFix }}
+{{- end }}
+{{- if .Compression }}
+compress {{ .Compression }}
+{{- end }}
+{{- if .CompressionLZO }}
+comp-lzo {{ .CompressionLZO }}
+{{- end }}
+{{- if .TLSAuthPath }}
+tls-auth {{ .TLSAuthPath }} 0
+{{- end }}
+{{- if .TLSCryptPath }}
+tls-crypt {{ .TLSCryptPath }}
+{{- end }}
+{{- if .TLSCryptV2Path }}
+tls-crypt-v2 {{ .TLSCryptV2Path }}{{ if .TLSCryptV2Option }} {{ .TLSCryptV2Option }}{{ end }}
+{{- end }}
+{{- if .RequireUserPass }}
+script-security 2
+auth-user-pass-verify {{ .AuthScriptPath }} via-file
+{{- end }}
+{{- if .CRResponseScriptPath }}
+client-crresponse {{ .CRResponseScriptPath }}
+{{- end }}
+{{- if gt .ManagementPort 0 }}
+management 0.0.0.0 {{ .ManagementPort }}
+management-client-auth
+{{- end }}
+{{- if gt .RenegotiationSeconds 0 }}
+reneg-sec {{ .RenegotiationSeconds }}
+{{- end }}
+{{- range .PushLines }}
+push "{{ . }}"
+{{- end }}
+log {{ .LogPath }}
