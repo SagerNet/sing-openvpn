@@ -1,0 +1,171 @@
+package openvpn
+
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+
+	E "github.com/sagernet/sing/common/exceptions"
+)
+
+type Server struct {
+	options                    ServerOptions
+	protocol                   string
+	listenNetwork              string
+	tls                        *tlsServer
+	incomingPacketDropLog      droppedPacketLog
+	incomingDataPackets        *dataPacketQueue[ServerDataBuffer]
+	droppedIncomingDataPackets atomic.Uint64
+	lifecycleAccess            sync.Mutex
+	lifecycleState             serverLifecycleState
+	closeDone                  chan struct{}
+	closeErr                   error
+	routes                     *peerRouteRegistry
+	ipPool                     *ipPool
+}
+
+type serverLifecycleState uint8
+
+const (
+	serverLifecycleInitial serverLifecycleState = iota
+	serverLifecycleStarting
+	serverLifecycleRunning
+	serverLifecycleClosing
+	serverLifecycleClosed
+)
+
+func NewServer(options ServerOptions) (*Server, error) {
+	if options.Context == nil {
+		options.Context = context.Background()
+	}
+	protocol, listenNetwork, err := resolveTransportProtocol(options.Transport.Protocol)
+	if err != nil {
+		return nil, err
+	}
+	if options.Transport.ListenAddress == "" && options.Transport.Listener == nil && options.Transport.PacketConn == nil {
+		return nil, ErrMissingListenAddress
+	}
+	if options.Transport.ListenAddress == "" {
+		if options.Transport.Listener != nil {
+			options.Transport.ListenAddress = options.Transport.Listener.Addr().String()
+		} else {
+			options.Transport.ListenAddress = options.Transport.PacketConn.LocalAddr().String()
+		}
+	}
+	mode, err := validateMode(options.Mode)
+	if err != nil {
+		return nil, err
+	}
+	if mode != ModeTLS {
+		return nil, E.Extend(ErrOptionNotSupported, "server static_key mode")
+	}
+	err = validateImplementedServerOptions(options)
+	if err != nil {
+		return nil, err
+	}
+	if options.Timing.RenegotiationInterval == 0 {
+		options.Timing.RenegotiationInterval = defaultRenegotiationInterval
+	}
+	server := &Server{
+		options:             options,
+		protocol:            protocol,
+		listenNetwork:       listenNetwork,
+		incomingDataPackets: newDataPacketQueueWithCapacity[ServerDataBuffer](dataPacketQueueCapacity),
+		closeDone:           make(chan struct{}),
+		routes:              newPeerRouteRegistry(),
+	}
+	server.incomingPacketDropLog.logger = options.Logger
+	server.incomingPacketDropLog.ctx = options.Context
+	server.tls, err = newTLSServer(server)
+	if err != nil {
+		return nil, err
+	}
+	return server, nil
+}
+
+func (s *Server) Start() error {
+	s.lifecycleAccess.Lock()
+	defer s.lifecycleAccess.Unlock()
+	switch s.lifecycleState {
+	case serverLifecycleRunning:
+		return nil
+	case serverLifecycleStarting:
+		return nil
+	case serverLifecycleClosing, serverLifecycleClosed:
+		return ErrServerClosed
+	}
+	s.lifecycleState = serverLifecycleStarting
+	err := s.prepareServerDataPlane()
+	if err != nil {
+		s.lifecycleState = serverLifecycleInitial
+		return err
+	}
+	err = s.tls.Start()
+	if err != nil {
+		s.lifecycleState = serverLifecycleInitial
+		return err
+	}
+	s.lifecycleState = serverLifecycleRunning
+	return nil
+}
+
+func (s *Server) Close() error {
+	s.lifecycleAccess.Lock()
+	switch s.lifecycleState {
+	case serverLifecycleClosing:
+		closeDone := s.closeDone
+		s.lifecycleAccess.Unlock()
+		<-closeDone
+		s.lifecycleAccess.Lock()
+		closeErr := s.closeErr
+		s.lifecycleAccess.Unlock()
+		return closeErr
+	case serverLifecycleClosed:
+		closeErr := s.closeErr
+		s.lifecycleAccess.Unlock()
+		return closeErr
+	default:
+		s.lifecycleState = serverLifecycleClosing
+		s.lifecycleAccess.Unlock()
+	}
+
+	closeErr := s.tls.Close()
+	s.incomingDataPackets.Drain(func(packet ServerDataBuffer) {
+		if packet.Buffer != nil {
+			packet.Buffer.Release()
+		}
+	})
+
+	s.lifecycleAccess.Lock()
+	s.closeErr = closeErr
+	s.lifecycleState = serverLifecycleClosed
+	close(s.closeDone)
+	s.lifecycleAccess.Unlock()
+	return closeErr
+}
+
+func (s *Server) activeLoopContext() (context.Context, error) {
+	s.lifecycleAccess.Lock()
+	defer s.lifecycleAccess.Unlock()
+	switch s.lifecycleState {
+	case serverLifecycleRunning:
+		return s.tls.loopContext, nil
+	case serverLifecycleClosing, serverLifecycleClosed:
+		return nil, ErrServerClosed
+	default:
+		return nil, ErrDataChannelNotReady
+	}
+}
+
+func (s *Server) requireRunning() error {
+	s.lifecycleAccess.Lock()
+	defer s.lifecycleAccess.Unlock()
+	switch s.lifecycleState {
+	case serverLifecycleRunning:
+		return nil
+	case serverLifecycleClosing, serverLifecycleClosed:
+		return ErrServerClosed
+	default:
+		return ErrDataChannelNotReady
+	}
+}

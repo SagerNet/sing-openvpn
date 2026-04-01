@@ -1,0 +1,56 @@
+client
+dev tun
+proto {{ .Protocol }}
+remote {{ .RemoteHost }} {{ .RemotePort }}
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+ca {{ .CAPath }}
+cert {{ .CertPath }}
+key {{ .KeyPath }}
+verb 4
+{{- if .Cipher }}
+cipher {{ .Cipher }}
+{{- end }}
+{{- if .Auth }}
+auth {{ .Auth }}
+{{- end }}
+{{- if .DataCiphers }}
+{{ .DataCiphersDirective }} {{ .DataCiphers }}
+{{- end }}
+{{- if gt .Fragment 0 }}
+fragment {{ .Fragment }}
+{{- end }}
+{{- if gt .MSSFix 0 }}
+mssfix {{ .MSSFix }}
+{{- end }}
+{{- if .Compression }}
+compress {{ .Compression }}
+{{- end }}
+{{- if .CompressionLZO }}
+comp-lzo {{ .CompressionLZO }}
+{{- end }}
+{{- if .TLSAuthPath }}
+tls-auth {{ .TLSAuthPath }} 1
+{{- end }}
+{{- if .TLSCryptPath }}
+tls-crypt {{ .TLSCryptPath }}
+{{- end }}
+{{- if .TLSCryptV2Path }}
+tls-crypt-v2 {{ .TLSCryptV2Path }}
+{{- end }}
+{{- if .AuthFilePath }}
+auth-user-pass {{ .AuthFilePath }}
+{{- end }}
+{{- if .RouteNoPull }}
+route-nopull
+{{- end }}
+{{- if gt .RenegotiationSeconds 0 }}
+reneg-sec {{ .RenegotiationSeconds }}
+{{- end }}
+{{- if .ExplicitNotify }}
+explicit-exit-notify 1
+{{- end }}
+log {{ .LogPath }}

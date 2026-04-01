@@ -1,0 +1,28 @@
+dev tun
+verb 4
+proto {{ .Protocol }}
+{{- if .LocalHost }}
+local {{ .LocalHost }}
+{{- end }}
+{{- if gt .LocalPort 0 }}
+lport {{ .LocalPort }}
+{{- end }}
+{{- if .RemoteHost }}
+remote {{ .RemoteHost }} {{ .RemotePort }}
+{{- end }}
+{{- if .UseFloat }}
+float
+{{- end }}
+{{- if .UseNobind }}
+nobind
+{{- end }}
+persist-key
+persist-tun
+ifconfig {{ .TunnelLocal }} {{ .TunnelRemote }}
+secret {{ .SecretPath }}{{ if ge .KeyDirection 0 }} {{ .KeyDirection }}{{ end }}
+cipher {{ .Cipher }}
+auth {{ .Auth }}
+{{- if .ExplicitNotify }}
+explicit-exit-notify 1
+{{- end }}
+log {{ .LogPath }}
