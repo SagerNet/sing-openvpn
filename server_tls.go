@@ -325,7 +325,8 @@ func (s *tlsServer) runStreamSession(streamConnection net.Conn, reservation *ser
 	if err != nil {
 		return
 	}
-	_ = session.runWithClientReset(clientResetPacket, protection)
+	err = session.runWithClientReset(clientResetPacket, protection)
+	session.logTermination(err)
 }
 
 func (s *tlsServer) runPacketLoop() {
@@ -436,18 +437,20 @@ func (s *tlsServer) runPacketLoop() {
 					defer resourceReservation.release()
 					defer s.unregisterSession(runningSession)
 					defer runningSession.finish()
+					var sessionErr error
 					if acceptedPreDecryptResult.directReset {
-						_ = runningSession.runWithClientReset(
+						sessionErr = runningSession.runWithClientReset(
 							acceptedPreDecryptResult.packet,
 							acceptedPreDecryptResult.protection,
 						)
 					} else {
-						_ = runningSession.runWithCookieResponse(
+						sessionErr = runningSession.runWithCookieResponse(
 							acceptedPreDecryptResult.packet,
 							acceptedPreDecryptResult.protection,
 							acceptedPreDecryptResult.serverSessionID,
 						)
 					}
+					runningSession.logTermination(sessionErr)
 				}(session, reservation, preDecryptResult)
 				continue
 			}

@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +48,7 @@ type tlsServerSession struct {
 	clientCertificateIdentity    *tlsClientCertificateIdentity
 	clientCertificateIdentitySet bool
 	authenticatedIdentity        string
+	connected                    bool
 	finishOnce                   sync.Once
 	finishDone                   chan struct{}
 }
@@ -496,8 +498,43 @@ func (s *tlsServerSession) runControlLoop() error {
 					return err
 				}
 			}
+			if !s.connected {
+				s.connected = true
+				if s.server.parent.options.Logger != nil {
+					logArguments := []any{"peer connected: ", s.peerAddress}
+					if s.authenticatedUsernameSet {
+						logArguments = append(logArguments, ", user ", strconv.Quote(s.authenticatedUsername))
+					}
+					if s.ifconfigInet4.IsValid() {
+						logArguments = append(logArguments, ", IPv4 ", s.ifconfigInet4)
+					}
+					if s.ifconfigInet6.IsValid() {
+						logArguments = append(logArguments, ", IPv6 ", s.ifconfigInet6)
+					}
+					s.server.parent.options.Logger.InfoContext(s.server.parent.options.Context, logArguments...)
+				}
+			}
 		}
 	}
+}
+
+func (s *tlsServerSession) logTermination(err error) {
+	logger := s.server.parent.options.Logger
+	if logger == nil {
+		return
+	}
+	logContext := s.server.parent.options.Context
+	if !s.connected {
+		if E.IsMulti(err, ErrAuthenticationFailed) {
+			logger.WarnContext(logContext, "authentication rejected for peer ", s.peerAddress)
+		}
+		return
+	}
+	if err == nil || E.IsMulti(err, net.ErrClosed, context.Canceled, ErrPeerExit, ErrPeerRestart, ErrServerClosed) {
+		logger.InfoContext(logContext, "peer disconnected: ", s.peerAddress)
+		return
+	}
+	logger.WarnContext(logContext, "peer disconnected abnormally: ", s.peerAddress, ": ", err)
 }
 
 func (s *tlsServerSession) verifyUserPass(ctx context.Context, message tlsKeyMethodMessage) error {

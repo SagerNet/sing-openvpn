@@ -275,11 +275,21 @@ func (c *Client) runSupervisor(ctx context.Context) {
 			}
 			cursor = c.nextConnectionCursor(cursor, err, false)
 			backoff = applyClientSessionErrorBackoff(err, backoff)
+			if c.options.Logger != nil {
+				c.options.Logger.DebugContext(ctx, "session with ", remote.address, " over ", remote.remote.Protocol, " failed; retrying in ", backoff, ": ", err)
+			}
 			if !waitClientReconnectBackoff(ctx, backoff) {
 				return
 			}
 			backoff = min(backoff*2, clientReconnectMaximumBackoff)
 			continue
+		}
+		if c.options.Logger != nil {
+			if firstSession {
+				c.options.Logger.InfoContext(ctx, "tunnel established to ", remote.address, " over ", remote.remote.Protocol)
+			} else {
+				c.options.Logger.InfoContext(ctx, "tunnel re-established to ", remote.address, " over ", remote.remote.Protocol)
+			}
 		}
 		firstSession = false
 		backoff = clientReconnectInitialBackoff
@@ -308,6 +318,9 @@ func (c *Client) runSupervisor(ctx context.Context) {
 		}
 		cursor = c.nextConnectionCursor(cursor, sessionErr, true)
 		backoff = applyClientSessionErrorBackoff(sessionErr, backoff)
+		if c.options.Logger != nil {
+			c.options.Logger.DebugContext(ctx, "session with ", remote.address, " over ", remote.remote.Protocol, " ended; retrying in ", backoff, ": ", sessionErr)
+		}
 		if !waitClientReconnectBackoff(ctx, backoff) {
 			return
 		}

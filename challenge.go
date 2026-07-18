@@ -113,9 +113,6 @@ func (c *Client) publishChallenge(state *pendingChallengeState) {
 	c.authentication.pendingChallenge = state
 	c.signalChallengeUpdatedLocked()
 	c.authentication.access.Unlock()
-	if c.options.Logger != nil {
-		c.options.Logger.DebugContext(c.options.Context, "openvpn: authentication challenge (", string(state.challenge.Kind), "): ", state.challenge.Message, state.challenge.URL)
-	}
 }
 
 func (c *Client) clearChallengeOwnedBy(owner any) {

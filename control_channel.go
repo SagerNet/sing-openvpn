@@ -61,12 +61,6 @@ func (c *tlsControlChannel) setTLSConnection(connection *tls.Conn) {
 	c.tlsAccess.Unlock()
 }
 
-func (c *tlsControlChannel) currentTLSConnection() *tls.Conn {
-	c.tlsAccess.RLock()
-	defer c.tlsAccess.RUnlock()
-	return c.tlsConnection
-}
-
 func newTLSControlChannel(
 	packetConnection proto.PacketConnection,
 	sessionManager *proto.SessionManager,

@@ -359,12 +359,10 @@ func (s *tlsServerSession) deliverIncomingPayloads(payloads [][]byte) {
 	ownerships := parent.routes.SourcesOwnedBy(payloads, s.tlsPeerSession)
 	for i, payload := range payloads {
 		if !ownerships[i].owned {
-			if parent.options.Logger != nil {
-				if ownerships[i].sourceAddress.IsValid() {
-					parent.options.Logger.DebugContext(parent.options.Context, "openvpn: bad source address from client ", s.peerAddress, " [", ownerships[i].sourceAddress, "], packet dropped")
-				} else {
-					parent.options.Logger.DebugContext(parent.options.Context, "openvpn: malformed IP packet from client ", s.peerAddress, ", packet dropped")
-				}
+			if ownerships[i].sourceAddress.IsValid() {
+				parent.incomingPacketDropLog.LogMessage("bad source address from client ", s.peerAddress, " [", ownerships[i].sourceAddress, "]")
+			} else {
+				parent.incomingPacketDropLog.LogMessage("malformed IP packet from client ", s.peerAddress)
 			}
 			continue
 		}
@@ -386,12 +384,10 @@ func (s *tlsServerSession) deliverIncomingBuffers(payloadBuffers []*buf.Buffer) 
 	ownerships := parent.routes.SourcesOwnedBy(payloads, s.tlsPeerSession)
 	for i, payloadBuffer := range payloadBuffers {
 		if !ownerships[i].owned {
-			if parent.options.Logger != nil {
-				if ownerships[i].sourceAddress.IsValid() {
-					parent.options.Logger.DebugContext(parent.options.Context, "openvpn: bad source address from client ", s.peerAddress, " [", ownerships[i].sourceAddress, "], packet dropped")
-				} else {
-					parent.options.Logger.DebugContext(parent.options.Context, "openvpn: malformed IP packet from client ", s.peerAddress, ", packet dropped")
-				}
+			if ownerships[i].sourceAddress.IsValid() {
+				parent.incomingPacketDropLog.LogMessage("bad source address from client ", s.peerAddress, " [", ownerships[i].sourceAddress, "]")
+			} else {
+				parent.incomingPacketDropLog.LogMessage("malformed IP packet from client ", s.peerAddress)
 			}
 			payloadBuffer.Release()
 			continue

@@ -161,6 +161,20 @@ func (l *droppedPacketLog) Log(err error) {
 	}
 }
 
+func (l *droppedPacketLog) LogMessage(message ...any) {
+	if l.logger == nil {
+		return
+	}
+	droppedCount := l.dropped.Add(1)
+	if droppedCount == 1 {
+		logArguments := append([]any{"dropped invalid data packet: "}, message...)
+		l.logger.WarnContext(l.ctx, logArguments...)
+	} else if droppedCount%droppedPacketLogInterval == 0 {
+		logArguments := append([]any{"dropped ", droppedCount, " invalid data packets, most recent: "}, message...)
+		l.logger.DebugContext(l.ctx, logArguments...)
+	}
+}
+
 func (l *droppedPacketLog) Reset() {
 	l.dropped.Store(0)
 }

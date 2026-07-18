@@ -154,8 +154,8 @@ func (c *Client) applyPushedOptions(options pushedOptions) pushedOptionsApplyRes
 	if options.Topology != "" {
 		updatedConfiguration.Topology = options.Topology
 	}
-	c.warnPushedOptionParseErrors(options.parseErrors)
 	c.debugPushedExcludedRoutes(options.excludedRoutes)
+	parseErrors := slices.Clone(options.parseErrors)
 	pushedLocalIPv4 := options.localAddressByFamily(true)
 	if len(pushedLocalIPv4) > 0 {
 		localIPv4, vpnGateway := pushedLocalAddressPrefixes(pushedLocalIPv4)
@@ -235,7 +235,11 @@ func (c *Client) applyPushedOptions(options pushedOptions) pushedOptionsApplyRes
 		if effectiveRouteGateway.IsValid() {
 			updatedConfiguration.RouteGateway = effectiveRouteGateway
 		} else {
-			c.warnPushedOptionParseError("route-gateway", options.routeGatewayFilterValue(), errInvalidPushedRouteGateway)
+			parseErrors = append(parseErrors, pushedOptionParseError{
+				Name:  "route-gateway",
+				Value: options.routeGatewayFilterValue(),
+				Err:   errInvalidPushedRouteGateway,
+			})
 		}
 	}
 	if !c.options.Pull.RouteNoPull {
@@ -261,6 +265,7 @@ func (c *Client) applyPushedOptions(options pushedOptions) pushedOptionsApplyRes
 	if isInitialPulledOptions {
 		c.maybeReconfigureDataFramingFromPushedOptions(options)
 	}
+	c.warnPushedOptionParseErrors(parseErrors)
 	configurationSnapshot := cloneTunnelConfiguration(c.tunnel.configuration)
 	eventQueued := false
 	if !deferInitialTunnelEvent {
@@ -342,19 +347,19 @@ func (c *Client) maybeReconfigureDataFramingFromPushedOptions(options pushedOpti
 	c.dataPlane.framing.Store(newDataChannelFraming(syntheticOptions, c.dataPlane.allowCompressionPolicy))
 }
 
-func (c *Client) warnPushedOptionParseError(optionName string, optionValue string, err error) {
-	if err == nil || c.options.Logger == nil {
-		return
-	}
-	c.options.Logger.WarnContext(c.options.Context, "openvpn: ignored pushed ", optionName, " ", strconv.Quote(optionValue), ": ", err)
-}
-
 func (c *Client) warnPushedOptionParseErrors(parseErrors []pushedOptionParseError) {
+	var ignoredOptions []string
 	for _, parseErr := range parseErrors {
+		if parseErr.Err == nil {
+			continue
+		}
 		if c.options.Pull.RouteNoPull && routeNoPullBlocksOption(parseErr.Name) {
 			continue
 		}
-		c.warnPushedOptionParseError(parseErr.Name, parseErr.Value, parseErr.Err)
+		ignoredOptions = append(ignoredOptions, parseErr.Name+" "+strconv.Quote(parseErr.Value)+": "+parseErr.Err.Error())
+	}
+	if len(ignoredOptions) > 0 && c.options.Logger != nil {
+		c.options.Logger.WarnContext(c.options.Context, "ignored pushed options: ", strings.Join(ignoredOptions, "; "))
 	}
 }
 
@@ -371,9 +376,11 @@ func (c *Client) debugPushedExcludedRoutes(excludedRoutes []pushedExcludedRoute)
 	if len(excludedRoutes) == 0 || c.options.Logger == nil {
 		return
 	}
+	ignoredRoutes := make([]string, 0, len(excludedRoutes))
 	for _, excludedRoute := range excludedRoutes {
-		c.options.Logger.DebugContext(c.options.Context, "openvpn: ignored pushed ", excludedRoute.Name, " ", strconv.Quote(excludedRoute.Value), ": route uses net_gateway")
+		ignoredRoutes = append(ignoredRoutes, excludedRoute.Name+" "+strconv.Quote(excludedRoute.Value))
 	}
+	c.options.Logger.DebugContext(c.options.Context, "ignored pushed routes using net_gateway: ", strings.Join(ignoredRoutes, "; "))
 }
 
 func appendUniqueStringValues(destination []string, values []string) []string {
