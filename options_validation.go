@@ -280,6 +280,9 @@ func validateImplementedServerOptions(options ServerOptions) error {
 	tlsAuthSet := tlsOptions.Auth.IsSet()
 	tlsCryptSet := tlsOptions.Crypt.IsSet()
 	tlsCryptV2Set := tlsOptions.CryptV2.IsSet()
+	if tlsOptions.CryptV2ForceCookie && !tlsCryptV2Set {
+		return E.New("ServerOptions.TLS.CryptV2ForceCookie requires tls-crypt-v2")
+	}
 	if tlsAuthSet && tlsCryptSet {
 		return E.Extend(ErrOptionNotSupported, "tls_auth+tls_crypt")
 	}
@@ -309,11 +312,11 @@ func validateClientDurationOptions(options ClientOptions) error {
 	if err != nil {
 		return err
 	}
-	err = validateDurationOption("ClientOptions.Timing.PingInterval", timingOptions.PingInterval)
+	err = validatePingDurationOption("ClientOptions.Timing.PingInterval", timingOptions.PingInterval)
 	if err != nil {
 		return err
 	}
-	err = validateDurationOption("ClientOptions.Timing.PingRestart", timingOptions.PingRestart)
+	err = validatePingDurationOption("ClientOptions.Timing.PingRestart", timingOptions.PingRestart)
 	if err != nil {
 		return err
 	}
@@ -330,11 +333,34 @@ func validateServerDurationOptions(options ServerOptions) error {
 	if err != nil {
 		return err
 	}
-	err = validateDurationOption("ServerOptions.Push.PingInterval", options.Push.PingInterval)
+	err = validateDurationOption("ServerOptions.Timing.HandWindow", timingOptions.HandWindow)
 	if err != nil {
 		return err
 	}
-	return validateDurationOption("ServerOptions.Push.PingRestart", options.Push.PingRestart)
+	err = validatePingDurationOption("ServerOptions.Timing.PingInterval", timingOptions.PingInterval)
+	if err != nil {
+		return err
+	}
+	err = validatePingDurationOption("ServerOptions.Timing.PingRestart", timingOptions.PingRestart)
+	if err != nil {
+		return err
+	}
+	err = validatePingDurationOption("ServerOptions.Push.PingInterval", options.Push.PingInterval)
+	if err != nil {
+		return err
+	}
+	return validatePingDurationOption("ServerOptions.Push.PingRestart", options.Push.PingRestart)
+}
+
+func validatePingDurationOption(name string, value time.Duration) error {
+	err := validateDurationOption(name, value)
+	if err != nil {
+		return err
+	}
+	if value%time.Second != 0 {
+		return E.New(name, " must use whole seconds")
+	}
+	return nil
 }
 
 func validateDurationOption(name string, value time.Duration) error {

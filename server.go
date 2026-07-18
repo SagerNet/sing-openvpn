@@ -63,8 +63,11 @@ func NewServer(options ServerOptions) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	if options.Timing.RenegotiationInterval == 0 {
+	if options.Timing.RenegotiationInterval == 0 && !options.Timing.RenegotiationIntervalSet {
 		options.Timing.RenegotiationInterval = defaultRenegotiationInterval
+	}
+	if options.Timing.HandWindow == 0 {
+		options.Timing.HandWindow = tlsHandshakeTotalDuration
 	}
 	server := &Server{
 		options:             options,

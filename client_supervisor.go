@@ -78,6 +78,9 @@ func classifyClientSessionError(err error) clientSessionErrorClass {
 		ErrCompressionPushRejected,
 		ErrCipherNegotiationFailed,
 		ErrChallengeCanceled,
+		ErrPingExitTimeout,
+		ErrInactiveTimeout,
+		ErrSessionTimeout,
 		errClientSessionConfiguration,
 	) {
 		return clientSessionErrorTerminal
@@ -215,7 +218,7 @@ func (c *Client) runSupervisor(ctx context.Context) {
 	defer c.closeSupervisorReadableState()
 	backoff := clientReconnectInitialBackoff
 	firstSession := true
-	remoteIndex := 0
+	cursor := clientConnectionCursor{}
 	for {
 		if ctx.Err() != nil || c.isClosed() {
 			return
@@ -228,7 +231,8 @@ func (c *Client) runSupervisor(ctx context.Context) {
 			c.setTerminalError(err)
 			return
 		}
-		remote := c.remotes[remoteIndex]
+		remote := c.remotes[cursor.remoteIndex]
+		remote.addressIndex = cursor.addressIndex
 		var session clientSession
 		session, err = c.newClientSession(!firstSession, remote)
 		var stopSessionOnContextDone func() bool
@@ -269,7 +273,7 @@ func (c *Client) runSupervisor(ctx context.Context) {
 				c.setTerminalError(err)
 				return
 			}
-			remoteIndex = c.nextRemoteIndex(remoteIndex, err)
+			cursor = c.nextConnectionCursor(cursor, err, false)
 			backoff = applyClientSessionErrorBackoff(err, backoff)
 			if !waitClientReconnectBackoff(ctx, backoff) {
 				return
@@ -302,7 +306,7 @@ func (c *Client) runSupervisor(ctx context.Context) {
 			c.setTerminalError(sessionErr)
 			return
 		}
-		remoteIndex = c.nextRemoteIndex(remoteIndex, sessionErr)
+		cursor = c.nextConnectionCursor(cursor, sessionErr, true)
 		backoff = applyClientSessionErrorBackoff(sessionErr, backoff)
 		if !waitClientReconnectBackoff(ctx, backoff) {
 			return
@@ -342,7 +346,7 @@ func applyClientSessionErrorBackoff(err error, backoff time.Duration) time.Durat
 }
 
 func (c *Client) newClientSession(useActiveAuthToken bool, remote clientRemote) (clientSession, error) {
-	c.resetSessionConfiguration()
+	c.resetSessionConfiguration(remote)
 	if c.mode == ModeStaticKey {
 		return newStaticKeyClientSession(c, remote)
 	}
@@ -352,24 +356,13 @@ func (c *Client) newClientSession(useActiveAuthToken bool, remote clientRemote) 
 	return nil, ErrUnsupportedMode
 }
 
-func (c *Client) nextRemoteIndex(current int, sessionErr error) int {
-	if len(c.remotes) <= 1 {
-		return 0
-	}
-	if temporaryAuthError, loaded := E.Cast[*AuthFailedTemporaryError](sessionErr); loaded {
-		switch temporaryAuthError.Advance {
-		case AuthFailedAdvanceStay, AuthFailedAdvanceNextAddress:
-			return current
-		case AuthFailedAdvanceNextRemote:
-			return (current + 1) % len(c.remotes)
-		}
-	}
-	return (current + 1) % len(c.remotes)
-}
-
-func (c *Client) resetSessionConfiguration() {
+func (c *Client) resetSessionConfiguration(remote clientRemote) {
 	c.tunnel.access.Lock()
 	tunnelConfiguration := buildInitialTunnelConfiguration(c.options)
+	tunnelConfiguration.ExplicitExitNotify = c.options.Transport.ExplicitExitNotify
+	if c.options.Pull.Enabled && strings.HasPrefix(remote.remote.Protocol, "udp") && !c.options.Timing.PingRestartSet {
+		tunnelConfiguration.PingRestart = prePullInitialPingRestart
+	}
 	tunnelConfiguration.AuthToken = c.tunnel.authToken
 	tunnelConfiguration.AuthTokenUser = c.tunnel.authTokenUser
 	c.tunnel.configuration = tunnelConfiguration
@@ -447,6 +440,7 @@ type clientRemote struct {
 	remote           Remote
 	address          string
 	transportNetwork string
+	addressIndex     int
 }
 
 func resolveClientRemotes(options *ClientOptions) ([]clientRemote, error) {

@@ -59,7 +59,7 @@ func (c *tlsClient) dispatchControlDirective(controlRecord []byte) error {
 	case tlsControlDirectiveAuthFailed:
 		return c.authFailedError(controlRecord)
 	case tlsControlDirectiveRestart:
-		return ErrServerRestart
+		return newServerRestartError(controlRecord)
 	case tlsControlDirectiveHalt:
 		return ErrServerHalt
 	case tlsControlDirectiveExit:
@@ -68,26 +68,30 @@ func (c *tlsClient) dispatchControlDirective(controlRecord []byte) error {
 		c.handleServerPushedInfo(controlRecord, time.Time{})
 		return nil
 	case tlsControlDirectivePushReply:
-		decodedPushedOptions, _, decoded := decodePushReplyPayload(controlRecord, c.remoteTransportAddress())
+		decodedPushedOptions, _, decoded := decodePushReplyPayloadWithFilters(controlRecord, c.remoteTransportAddress(), c.parent.options.Pull.Filters)
 		if !decoded {
 			return nil
 		}
-		c.parent.applyPushedOptions(decodedPushedOptions)
-		pullFilterRejection := c.parent.PullFilterRejection()
-		if pullFilterRejection != "" {
-			return ErrPullFilterRejected
-		}
-		compressionPushRejection := c.parent.CompressionPushRejection()
-		if compressionPushRejection != "" {
-			return ErrCompressionPushRejected
-		}
-		if decodedPushedOptions.PeerID != nil {
-			c.setPeerID(decodedPushedOptions.PeerID)
-		}
-		return nil
+		return c.applyDecodedPushedOptions(decodedPushedOptions)
 	default:
 		return nil
 	}
+}
+
+func (c *tlsClient) applyDecodedPushedOptions(options pushedOptions) error {
+	c.pushAccess.Lock()
+	defer c.pushAccess.Unlock()
+	applyResult := c.parent.applyPushedOptions(options)
+	if applyResult.pullFilterRejection != "" {
+		return ErrPullFilterRejected
+	}
+	if applyResult.compressionPushRejection != "" {
+		return ErrCompressionPushRejected
+	}
+	if options.PeerID != nil {
+		c.setPeerID(options.PeerID)
+	}
+	return nil
 }
 
 func (c *tlsClient) handleServerPushedInfo(controlRecord []byte, deadline time.Time) {
@@ -166,25 +170,4 @@ func tunnelUsesKeyMaterialExport(tunnelConfiguration TunnelConfiguration) bool {
 		}
 	}
 	return false
-}
-
-func parsePushedCipher(payload []byte) string {
-	payloadValue := normalizeControlPayload(payload)
-	if payloadValue == "" {
-		return ""
-	}
-	payloadFields := splitEscapedCommaFields(payloadValue)
-	if len(payloadFields) == 0 || !strings.EqualFold(strings.TrimSpace(payloadFields[0]), pushReplyPayloadPrefix) {
-		return ""
-	}
-	for _, payloadField := range payloadFields[1:] {
-		optionName, optionValue, hasOption := parsePushReplyField(payloadField)
-		if !hasOption {
-			continue
-		}
-		if strings.EqualFold(optionName, "cipher") {
-			return optionValue
-		}
-	}
-	return ""
 }

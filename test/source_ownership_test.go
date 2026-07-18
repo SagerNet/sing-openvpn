@@ -25,6 +25,7 @@ func TestTLSServerRejectsUnownedTunnelSources(t *testing.T) {
 			Certificate:          Material{Path: filepath.Join("testdata", "openvpn", "pki", "server.crt")},
 			Key:                  Material{Path: filepath.Join("testdata", "openvpn", "pki", "server.key")},
 		},
+		Authentication: ServerAuthenticationOptions{DuplicateCN: true},
 		Tunnel: ServerTunnelOptions{
 			AddressPools: []netip.Prefix{netip.MustParsePrefix("10.8.0.0/24"), netip.MustParsePrefix("fd00::/64")},
 			Topology:     "subnet",

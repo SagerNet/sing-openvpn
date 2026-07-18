@@ -28,39 +28,55 @@ type pushedExcludedRoute struct {
 	Value string
 }
 
+type pushedPingTimeoutAction uint8
+
+const (
+	pushedPingTimeoutNone pushedPingTimeoutAction = iota
+	pushedPingTimeoutRestart
+	pushedPingTimeoutExit
+)
+
 type wirePushedOptions struct {
-	Topology             string
-	TunMTU               uint32
-	Ifconfig             []string
-	IfconfigIPv6         []string
-	RouteGateway         string
-	Route                []string
-	RouteIPv6            []string
-	DNS                  []string
-	DHCPOptions          []string
-	BlockIPv6            bool
-	BlockOutsideDNS      bool
-	RedirectGateway      bool
-	RedirectGatewayFlags []string
-	RedirectPrivate      bool
-	RouteMetric          int
-	PingInterval         time.Duration
-	PingRestart          time.Duration
-	AuthToken            string
-	AuthTokenUser        string
-	PeerID               *uint32
-	SelectedCipher       string
-	SelectedAuth         string
-	ProtocolFlags        []string
-	KeyDerivation        string
-	ExplicitExitNotify   uint32
-	Compression          string
-	CompressionLZO       string
-	InactiveTimeout      time.Duration
-	InactiveMinimumBytes uint64
-	SessionTimeout       time.Duration
-	PingExit             time.Duration
-	PingTimerRemote      bool
+	Topology              string
+	TunMTU                uint32
+	Ifconfig              string
+	IfconfigIPv6          string
+	RouteGateway          string
+	Route                 []string
+	RouteIPv6             []string
+	DNS                   []string
+	DHCPOptions           []string
+	BlockIPv6             bool
+	BlockOutsideDNS       bool
+	RedirectGateway       bool
+	RedirectGatewayFlags  []string
+	RedirectPrivate       bool
+	RouteMetric           int
+	RouteMetricSet        bool
+	PingInterval          time.Duration
+	PingIntervalSet       bool
+	PingRestart           time.Duration
+	PingRestartSet        bool
+	AuthToken             string
+	AuthTokenUser         string
+	PeerID                *uint32
+	SelectedCipher        string
+	SelectedAuth          string
+	ProtocolFlags         []string
+	KeyDerivation         string
+	ExplicitExitNotify    uint32
+	ExplicitExitNotifySet bool
+	Compression           string
+	CompressionLZO        string
+	InactiveTimeout       time.Duration
+	InactiveMinimumBytes  uint64
+	InactiveTimeoutSet    bool
+	SessionTimeout        time.Duration
+	SessionTimeoutSet     bool
+	PingExit              time.Duration
+	PingExitSet           bool
+	PingTimeoutAction     pushedPingTimeoutAction
+	PingTimerRemote       bool
 }
 
 type pushOptionsKind int
@@ -107,7 +123,7 @@ func appendPushReplyPayloadSegment(accumulatedFields []string, payload []byte) (
 	return accumulatedFields, continuation, true
 }
 
-func decodePushReplyPayload(payload []byte, remoteHost netip.Addr) (pushedOptions, int, bool) {
+func decodePushReplyPayloadWithFilters(payload []byte, remoteHost netip.Addr, filters []PullFilter) (pushedOptions, int, bool) {
 	payloadValue := normalizeControlPayload(payload)
 	if payloadValue == "" {
 		return pushedOptions{}, 0, false
@@ -127,7 +143,17 @@ func decodePushReplyPayload(payload []byte, remoteHost netip.Addr) (pushedOption
 	}
 	var wireOptions wirePushedOptions
 	var continuation int
+	var pullFilterRejection string
 	for _, payloadField := range payloadFields[1:] {
+		optionLine := strings.TrimLeft(payloadField, " \t\r\n\v\f")
+		allowed, rejected := applyPullFilters(filters, optionLine)
+		if rejected {
+			pullFilterRejection = optionLine
+			break
+		}
+		if !allowed {
+			continue
+		}
 		optionName, optionValue, hasOption := parsePushReplyField(payloadField)
 		if !hasOption {
 			continue
@@ -144,11 +170,11 @@ func decodePushReplyPayload(payload []byte, remoteHost netip.Addr) (pushedOption
 			}
 		case "ifconfig":
 			if optionValue != "" {
-				wireOptions.Ifconfig = append(wireOptions.Ifconfig, optionValue)
+				wireOptions.Ifconfig = optionValue
 			}
 		case "ifconfig-ipv6":
 			if optionValue != "" {
-				wireOptions.IfconfigIPv6 = append(wireOptions.IfconfigIPv6, optionValue)
+				wireOptions.IfconfigIPv6 = optionValue
 			}
 		case "route":
 			if optionValue != "" {
@@ -183,30 +209,22 @@ func decodePushReplyPayload(payload []byte, remoteHost netip.Addr) (pushedOption
 			wireOptions.RedirectPrivate = true
 		case "route-metric":
 			routeMetricValue, err := strconv.Atoi(optionValue)
-			if err == nil {
+			if err == nil && routeMetricValue >= 0 {
 				wireOptions.RouteMetric = routeMetricValue
-			}
-		case "keepalive":
-			keepaliveFields := strings.Fields(optionValue)
-			if len(keepaliveFields) >= 2 {
-				pingInterval, intervalErr := strconv.Atoi(keepaliveFields[0])
-				pingRestart, restartErr := strconv.Atoi(keepaliveFields[1])
-				if intervalErr == nil && restartErr == nil && pingInterval >= 0 && pingRestart >= 0 {
-					wireOptions.PingInterval = time.Duration(pingInterval) * time.Second
-					wireOptions.PingRestart = time.Duration(pingRestart) * time.Second
-				}
+				wireOptions.RouteMetricSet = true
 			}
 		case "ping":
-			// Upstream helper_keepalive (helper.c) expands keepalive into
-			// pushed ping and ping-restart directives.
 			pingValue, err := strconv.Atoi(strings.TrimSpace(optionValue))
 			if err == nil && pingValue >= 0 {
 				wireOptions.PingInterval = time.Duration(pingValue) * time.Second
+				wireOptions.PingIntervalSet = true
 			}
 		case "ping-restart":
 			pingRestartValue, err := strconv.Atoi(strings.TrimSpace(optionValue))
 			if err == nil && pingRestartValue >= 0 {
 				wireOptions.PingRestart = time.Duration(pingRestartValue) * time.Second
+				wireOptions.PingRestartSet = true
+				wireOptions.PingTimeoutAction = pushedPingTimeoutRestart
 			}
 		case "auth-token":
 			wireOptions.AuthToken = optionValue
@@ -238,8 +256,10 @@ func decodePushReplyPayload(payload []byte, remoteHost netip.Addr) (pushedOption
 			notifyValue, err := strconv.ParseUint(strings.TrimSpace(optionValue), 10, 32)
 			if err == nil {
 				wireOptions.ExplicitExitNotify = uint32(notifyValue)
+				wireOptions.ExplicitExitNotifySet = true
 			} else if optionValue == "" {
 				wireOptions.ExplicitExitNotify = 1
+				wireOptions.ExplicitExitNotifySet = true
 			}
 		case "compress":
 			compressValue := strings.TrimSpace(optionValue)
@@ -263,6 +283,7 @@ func decodePushReplyPayload(payload []byte, remoteHost netip.Addr) (pushedOption
 				inactiveSeconds, err := strconv.Atoi(inactiveFields[0])
 				if err == nil && inactiveSeconds >= 0 {
 					wireOptions.InactiveTimeout = time.Duration(inactiveSeconds) * time.Second
+					wireOptions.InactiveTimeoutSet = true
 				}
 				if len(inactiveFields) >= 2 {
 					// Upstream parse_inactive (options.c) clamps negative
@@ -277,11 +298,14 @@ func decodePushReplyPayload(payload []byte, remoteHost netip.Addr) (pushedOption
 			sessionSeconds, err := strconv.Atoi(strings.TrimSpace(optionValue))
 			if err == nil && sessionSeconds >= 0 {
 				wireOptions.SessionTimeout = time.Duration(sessionSeconds) * time.Second
+				wireOptions.SessionTimeoutSet = true
 			}
 		case "ping-exit":
 			pingExitSeconds, err := strconv.Atoi(strings.TrimSpace(optionValue))
 			if err == nil && pingExitSeconds >= 0 {
 				wireOptions.PingExit = time.Duration(pingExitSeconds) * time.Second
+				wireOptions.PingExitSet = true
+				wireOptions.PingTimeoutAction = pushedPingTimeoutExit
 			}
 		case "ping-timer-rem":
 			wireOptions.PingTimerRemote = true
@@ -294,43 +318,76 @@ func decodePushReplyPayload(payload []byte, remoteHost netip.Addr) (pushedOption
 	}
 	options := pushedOptionsFromWire(wireOptions, remoteHost)
 	options.kind = kind
+	options.pullFilterRejection = pullFilterRejection
 	return options, continuation, true
+}
+
+func applyPullFilters(filters []PullFilter, optionLine string) (bool, bool) {
+	for _, filter := range filters {
+		if !strings.HasPrefix(optionLine, filter.Text) {
+			continue
+		}
+		switch filter.Action {
+		case "accept":
+			return true, false
+		case "ignore":
+			return false, false
+		case "reject":
+			return false, true
+		}
+	}
+	return true, false
 }
 
 func pushedOptionsFromWire(wireOptions wirePushedOptions, remoteHost netip.Addr) pushedOptions {
 	options := pushedOptions{
-		Topology:             wireOptions.Topology,
-		TunMTU:               wireOptions.TunMTU,
-		DHCPOptions:          slices.Clone(wireOptions.DHCPOptions),
-		BlockIPv6:            wireOptions.BlockIPv6,
-		BlockOutsideDNS:      wireOptions.BlockOutsideDNS,
-		RedirectGateway:      wireOptions.RedirectGateway,
-		RedirectGatewayFlags: slices.Clone(wireOptions.RedirectGatewayFlags),
-		RedirectPrivate:      wireOptions.RedirectPrivate,
-		RouteMetric:          wireOptions.RouteMetric,
-		PingInterval:         wireOptions.PingInterval,
-		PingRestart:          wireOptions.PingRestart,
-		AuthToken:            wireOptions.AuthToken,
-		AuthTokenUser:        wireOptions.AuthTokenUser,
-		PeerID:               wireOptions.PeerID,
-		SelectedCipher:       wireOptions.SelectedCipher,
-		SelectedAuth:         wireOptions.SelectedAuth,
-		ProtocolFlags:        slices.Clone(wireOptions.ProtocolFlags),
-		KeyDerivation:        wireOptions.KeyDerivation,
-		ExplicitExitNotify:   wireOptions.ExplicitExitNotify,
-		Compression:          wireOptions.Compression,
-		CompressionLZO:       wireOptions.CompressionLZO,
-		InactiveTimeout:      wireOptions.InactiveTimeout,
-		InactiveMinimumBytes: wireOptions.InactiveMinimumBytes,
-		SessionTimeout:       wireOptions.SessionTimeout,
-		PingExit:             wireOptions.PingExit,
-		PingTimerRemote:      wireOptions.PingTimerRemote,
+		Topology:              wireOptions.Topology,
+		TunMTU:                wireOptions.TunMTU,
+		DHCPOptions:           slices.Clone(wireOptions.DHCPOptions),
+		BlockIPv6:             wireOptions.BlockIPv6,
+		BlockOutsideDNS:       wireOptions.BlockOutsideDNS,
+		RedirectGateway:       wireOptions.RedirectGateway,
+		RedirectGatewayFlags:  slices.Clone(wireOptions.RedirectGatewayFlags),
+		RedirectPrivate:       wireOptions.RedirectPrivate,
+		RouteMetric:           wireOptions.RouteMetric,
+		RouteMetricSet:        wireOptions.RouteMetricSet,
+		PingInterval:          wireOptions.PingInterval,
+		PingIntervalSet:       wireOptions.PingIntervalSet,
+		PingRestart:           wireOptions.PingRestart,
+		PingRestartSet:        wireOptions.PingRestartSet,
+		AuthToken:             wireOptions.AuthToken,
+		AuthTokenUser:         wireOptions.AuthTokenUser,
+		PeerID:                wireOptions.PeerID,
+		SelectedCipher:        wireOptions.SelectedCipher,
+		SelectedAuth:          wireOptions.SelectedAuth,
+		ProtocolFlags:         slices.Clone(wireOptions.ProtocolFlags),
+		KeyDerivation:         wireOptions.KeyDerivation,
+		ExplicitExitNotify:    wireOptions.ExplicitExitNotify,
+		ExplicitExitNotifySet: wireOptions.ExplicitExitNotifySet,
+		Compression:           wireOptions.Compression,
+		CompressionLZO:        wireOptions.CompressionLZO,
+		InactiveTimeout:       wireOptions.InactiveTimeout,
+		InactiveMinimumBytes:  wireOptions.InactiveMinimumBytes,
+		InactiveTimeoutSet:    wireOptions.InactiveTimeoutSet,
+		SessionTimeout:        wireOptions.SessionTimeout,
+		SessionTimeoutSet:     wireOptions.SessionTimeoutSet,
+		PingExit:              wireOptions.PingExit,
+		PingExitSet:           wireOptions.PingExitSet,
+		PingTimerRemote:       wireOptions.PingTimerRemote,
 	}
-	for _, value := range wireOptions.Ifconfig {
-		options.addWireIfconfig(value, wireOptions.Topology)
+	switch wireOptions.PingTimeoutAction {
+	case pushedPingTimeoutRestart:
+		options.PingExit = 0
+		options.PingExitSet = false
+	case pushedPingTimeoutExit:
+		options.PingRestart = 0
+		options.PingRestartSet = false
 	}
-	for _, value := range wireOptions.IfconfigIPv6 {
-		options.addWireIfconfigIPv6(value)
+	if wireOptions.Ifconfig != "" {
+		options.addWireIfconfig(wireOptions.Ifconfig, wireOptions.Topology)
+	}
+	if wireOptions.IfconfigIPv6 != "" {
+		options.addWireIfconfigIPv6(wireOptions.IfconfigIPv6)
 	}
 	options.setWireRouteGateway(wireOptions.RouteGateway)
 	for _, value := range wireOptions.Route {
@@ -597,15 +654,4 @@ func parsePushReplyField(value string) (string, string, bool) {
 	optionName := fieldValue[:separatorIndex]
 	optionValue := strings.TrimSpace(fieldValue[separatorIndex+1:])
 	return optionName, optionValue, true
-}
-
-func formatInactivePullFilterValue(inactiveTimeout time.Duration, inactiveMinimumBytes uint64) string {
-	if inactiveTimeout == 0 {
-		return ""
-	}
-	result := strconv.FormatInt(int64(inactiveTimeout/time.Second), 10)
-	if inactiveMinimumBytes > 0 {
-		result += " " + strconv.FormatUint(inactiveMinimumBytes, 10)
-	}
-	return result
 }

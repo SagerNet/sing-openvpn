@@ -3,6 +3,7 @@ package openvpn
 import (
 	"net/netip"
 	"sync"
+	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
 )
@@ -11,6 +12,7 @@ const (
 	ipv4TopologySubnet = "subnet"
 	ipv4TopologyP2P    = "p2p"
 	ipv4TopologyNet30  = "net30"
+	ipPoolMaximumSize  = 65536
 )
 
 type ipv4PoolLease struct {
@@ -26,9 +28,15 @@ type ipPool struct {
 	ipv4Start    netip.Addr
 	ipv4End      netip.Addr
 	ipv4UsedSet  map[netip.Addr]struct{}
+	ipv4Identity map[netip.Addr]string
+	ipv4Address  map[string]netip.Addr
+	ipv4Released map[netip.Addr]time.Time
 	ipv6Prefix   netip.Prefix
 	ipv6Server   netip.Addr
 	ipv6UsedSet  map[netip.Addr]struct{}
+	ipv6Identity map[netip.Addr]string
+	ipv6Address  map[string]netip.Addr
+	ipv6Released map[netip.Addr]time.Time
 }
 
 func newIPPool(addressPools []netip.Prefix, topology string) (*ipPool, error) {
@@ -39,7 +47,13 @@ func newIPPool(addressPools []netip.Prefix, topology string) (*ipPool, error) {
 	pool := &ipPool{
 		ipv4Topology: resolvedTopology,
 		ipv4UsedSet:  make(map[netip.Addr]struct{}),
+		ipv4Identity: make(map[netip.Addr]string),
+		ipv4Address:  make(map[string]netip.Addr),
+		ipv4Released: make(map[netip.Addr]time.Time),
 		ipv6UsedSet:  make(map[netip.Addr]struct{}),
+		ipv6Identity: make(map[netip.Addr]string),
+		ipv6Address:  make(map[string]netip.Addr),
+		ipv6Released: make(map[netip.Addr]time.Time),
 	}
 	for _, prefix := range addressPools {
 		if !prefix.IsValid() {
@@ -175,70 +189,51 @@ func (p *ipPool) IPv6Prefix() netip.Prefix {
 }
 
 func (p *ipPool) AllocateIPv4() (ipv4PoolLease, error) {
+	return p.AllocateIPv4ForIdentity("")
+}
+
+func (p *ipPool) AllocateIPv4ForIdentity(identity string) (ipv4PoolLease, error) {
 	if !p.HasIPv4() {
 		return ipv4PoolLease{}, E.New("ipv4 pool not configured")
 	}
 	p.access.Lock()
 	defer p.access.Unlock()
-	switch p.ipv4Topology {
-	case ipv4TopologySubnet, ipv4TopologyP2P:
-		for client := p.ipv4Start; client.IsValid() && client.Compare(p.ipv4End) <= 0; client = client.Next() {
-			if client == p.ipv4Server {
-				continue
-			}
-			if _, used := p.ipv4UsedSet[client]; used {
-				continue
-			}
-			lease := ipv4PoolLease{Client: client}
-			if p.ipv4Topology == ipv4TopologyP2P {
-				lease.Peer = p.ipv4Server
-			}
-			p.ipv4UsedSet[client] = struct{}{}
-			return lease, nil
+	if identity != "" {
+		if previous, found := p.findAvailableIPv4Lease(identity, true); found {
+			p.commitIPv4Lease(previous, identity)
+			return previous, nil
 		}
-	case ipv4TopologyNet30:
-		for block := p.ipv4Start; block.IsValid() && block.Compare(p.ipv4End) <= 0; block = addIPv4(block, 4) {
-			peer := addIPv4(block, 1)
-			client := addIPv4(block, 2)
-			if !peer.IsValid() || !client.IsValid() || client.Compare(p.ipv4End) > 0 {
-				break
-			}
-			if peer == p.ipv4Server || client == p.ipv4Server {
-				continue
-			}
-			if _, used := p.ipv4UsedSet[client]; used {
-				continue
-			}
-			p.ipv4UsedSet[client] = struct{}{}
-			return ipv4PoolLease{Client: client, Peer: peer}, nil
-		}
+	}
+	lease, found := p.findAvailableIPv4Lease(identity, false)
+	if found {
+		p.commitIPv4Lease(lease, identity)
+		return lease, nil
 	}
 	return ipv4PoolLease{}, ErrIPPoolExhausted
 }
 
 func (p *ipPool) AllocateIPv6() (netip.Addr, error) {
+	return p.AllocateIPv6ForIdentity("")
+}
+
+func (p *ipPool) AllocateIPv6ForIdentity(identity string) (netip.Addr, error) {
 	if !p.HasIPv6() {
 		return netip.Addr{}, E.New("ipv6 pool not configured")
 	}
 	p.access.Lock()
 	defer p.access.Unlock()
-	prefix := p.ipv6Prefix
-	current := prefix.Addr()
-	for {
-		current = current.Next()
-		if !current.IsValid() || !prefix.Contains(current) {
-			return netip.Addr{}, ErrIPPoolExhausted
+	if identity != "" {
+		if previous, found := p.findAvailableIPv6Address(identity, true); found {
+			p.commitIPv6Address(previous, identity)
+			return previous, nil
 		}
-		if current == p.ipv6Server {
-			continue
-		}
-		_, used := p.ipv6UsedSet[current]
-		if used {
-			continue
-		}
-		p.ipv6UsedSet[current] = struct{}{}
-		return current, nil
 	}
+	address, found := p.findAvailableIPv6Address(identity, false)
+	if found {
+		p.commitIPv6Address(address, identity)
+		return address, nil
+	}
+	return netip.Addr{}, ErrIPPoolExhausted
 }
 
 func (p *ipPool) Release(address netip.Addr) {
@@ -249,9 +244,172 @@ func (p *ipPool) Release(address netip.Addr) {
 	defer p.access.Unlock()
 	if address.Is4() {
 		delete(p.ipv4UsedSet, address)
+		if p.ipv4Identity[address] != "" {
+			p.ipv4Released[address] = time.Now()
+		} else {
+			delete(p.ipv4Released, address)
+		}
 		return
 	}
 	delete(p.ipv6UsedSet, address)
+	if p.ipv6Identity[address] != "" {
+		p.ipv6Released[address] = time.Now()
+	} else {
+		delete(p.ipv6Released, address)
+	}
+}
+
+func (p *ipPool) visitIPv4Leases(visitor func(ipv4PoolLease) bool) {
+	switch p.ipv4Topology {
+	case ipv4TopologySubnet, ipv4TopologyP2P:
+		for client := p.ipv4Start; client.IsValid() && client.Compare(p.ipv4End) <= 0; client = client.Next() {
+			if client == p.ipv4Server {
+				continue
+			}
+			lease := ipv4PoolLease{Client: client}
+			if p.ipv4Topology == ipv4TopologyP2P {
+				lease.Peer = p.ipv4Server
+			}
+			if !visitor(lease) {
+				return
+			}
+		}
+	case ipv4TopologyNet30:
+		for block := p.ipv4Start; block.IsValid() && block.Compare(p.ipv4End) <= 0; block = addIPv4(block, 4) {
+			peer := addIPv4(block, 1)
+			client := addIPv4(block, 2)
+			if !peer.IsValid() || !client.IsValid() || client.Compare(p.ipv4End) > 0 {
+				return
+			}
+			if peer == p.ipv4Server || client == p.ipv4Server {
+				continue
+			}
+			if !visitor(ipv4PoolLease{Client: client, Peer: peer}) {
+				return
+			}
+		}
+	}
+}
+
+func (p *ipPool) findAvailableIPv4Lease(identity string, requireIdentity bool) (ipv4PoolLease, bool) {
+	if requireIdentity {
+		previous := p.ipv4Address[identity]
+		if !previous.IsValid() {
+			return ipv4PoolLease{}, false
+		}
+		if _, used := p.ipv4UsedSet[previous]; used {
+			return ipv4PoolLease{}, false
+		}
+		return p.ipv4Lease(previous), true
+	}
+	var selected ipv4PoolLease
+	var selectedRelease time.Time
+	p.visitIPv4Leases(func(candidate ipv4PoolLease) bool {
+		if _, used := p.ipv4UsedSet[candidate.Client]; used {
+			return true
+		}
+		if identity == "" {
+			selected = candidate
+			return false
+		}
+		released := p.ipv4Released[candidate.Client]
+		if !selected.Client.IsValid() || released.Before(selectedRelease) {
+			selected = candidate
+			selectedRelease = released
+		}
+		if released.IsZero() {
+			return false
+		}
+		return true
+	})
+	return selected, selected.Client.IsValid()
+}
+
+func (p *ipPool) ipv4Lease(address netip.Addr) ipv4PoolLease {
+	lease := ipv4PoolLease{Client: address}
+	switch p.ipv4Topology {
+	case ipv4TopologyP2P:
+		lease.Peer = p.ipv4Server
+	case ipv4TopologyNet30:
+		lease.Peer = address.Prev()
+	}
+	return lease
+}
+
+func (p *ipPool) commitIPv4Lease(lease ipv4PoolLease, identity string) {
+	p.ipv4UsedSet[lease.Client] = struct{}{}
+	delete(p.ipv4Released, lease.Client)
+	previousIdentity := p.ipv4Identity[lease.Client]
+	if previousIdentity != "" && previousIdentity != identity && p.ipv4Address[previousIdentity] == lease.Client {
+		delete(p.ipv4Address, previousIdentity)
+	}
+	if identity != "" {
+		if previousAddress := p.ipv4Address[identity]; previousAddress.IsValid() && previousAddress != lease.Client {
+			delete(p.ipv4Identity, previousAddress)
+			delete(p.ipv4Released, previousAddress)
+		}
+		p.ipv4Identity[lease.Client] = identity
+		p.ipv4Address[identity] = lease.Client
+	} else {
+		delete(p.ipv4Identity, lease.Client)
+	}
+}
+
+func (p *ipPool) findAvailableIPv6Address(identity string, requireIdentity bool) (netip.Addr, bool) {
+	if requireIdentity {
+		previous := p.ipv6Address[identity]
+		if !previous.IsValid() || !p.ipv6Prefix.Contains(previous) || previous == p.ipv6Server {
+			return netip.Addr{}, false
+		}
+		_, used := p.ipv6UsedSet[previous]
+		return previous, !used
+	}
+	var selected netip.Addr
+	var selectedRelease time.Time
+	visited := 0
+	for current := p.ipv6Prefix.Addr().Next(); current.IsValid() && p.ipv6Prefix.Contains(current) && visited < ipPoolMaximumSize; current = current.Next() {
+		if current == p.ipv6Server {
+			continue
+		}
+		visited++
+		if _, used := p.ipv6UsedSet[current]; used {
+			continue
+		}
+		if identity == "" {
+			return current, true
+		}
+		if p.ipv6Identity[current] == "" && len(p.ipv6Address) >= ipPoolMaximumSize {
+			continue
+		}
+		released := p.ipv6Released[current]
+		if !selected.IsValid() || released.Before(selectedRelease) {
+			selected = current
+			selectedRelease = released
+		}
+		if released.IsZero() {
+			break
+		}
+	}
+	return selected, selected.IsValid()
+}
+
+func (p *ipPool) commitIPv6Address(address netip.Addr, identity string) {
+	p.ipv6UsedSet[address] = struct{}{}
+	delete(p.ipv6Released, address)
+	previousIdentity := p.ipv6Identity[address]
+	if previousIdentity != "" && previousIdentity != identity && p.ipv6Address[previousIdentity] == address {
+		delete(p.ipv6Address, previousIdentity)
+	}
+	if identity != "" {
+		if previousAddress := p.ipv6Address[identity]; previousAddress.IsValid() && previousAddress != address {
+			delete(p.ipv6Identity, previousAddress)
+			delete(p.ipv6Released, previousAddress)
+		}
+		p.ipv6Identity[address] = identity
+		p.ipv6Address[identity] = address
+	} else {
+		delete(p.ipv6Identity, address)
+	}
 }
 
 func lastIPv4InPrefix(prefix netip.Prefix) netip.Addr {

@@ -1,9 +1,9 @@
 package openvpn
 
 import (
+	"bytes"
 	"context"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
@@ -27,10 +27,12 @@ type staticKeyClientSession struct {
 	closeOnce      sync.Once
 	closeErr       error
 
-	access      sync.Mutex
-	writeAccess sync.Mutex
-	ready       bool
-	closed      bool
+	access           sync.Mutex
+	writeAccess      sync.Mutex
+	ready            bool
+	closed           bool
+	lastInboundTime  time.Time
+	lastOutboundTime time.Time
 }
 
 func newStaticKeyClientSession(parent *Client, remote clientRemote) (*staticKeyClientSession, error) {
@@ -74,7 +76,9 @@ func (s *staticKeyClientSession) Initialize(ctx context.Context) error {
 	}
 	var underlyingConnection net.Conn
 	var err error
-	if s.parent.options.Transport.DialContext != nil {
+	if s.parent.options.Transport.DialContextWithAddressIndex != nil {
+		underlyingConnection, err = s.parent.options.Transport.DialContextWithAddressIndex(sessionContext, s.remote.transportNetwork, s.remote.address, s.remote.addressIndex)
+	} else if s.parent.options.Transport.DialContext != nil {
 		underlyingConnection, err = s.parent.options.Transport.DialContext(sessionContext, s.remote.transportNetwork, s.remote.address)
 	} else {
 		underlyingConnection, err = (&net.Dialer{}).DialContext(sessionContext, s.remote.transportNetwork, s.remote.address)
@@ -123,6 +127,9 @@ func (s *staticKeyClientSession) Start() error {
 	}
 	s.sessionManager.SetNegotiationState(proto.NegotiationStatePreStart)
 	s.sessionManager.SetNegotiationState(proto.NegotiationStateControlReady)
+	now := time.Now()
+	s.lastInboundTime = now
+	s.lastOutboundTime = now
 	s.ready = true
 	go s.readLoop()
 	s.access.Unlock()
@@ -180,9 +187,14 @@ func (s *staticKeyClientSession) WriteDataPackets(packets [][]byte) error {
 	if encodeErr == nil {
 		encodeErr = preparationErr
 	}
-	_, writeErr := s.packetConnection.WritePackets(rawPackets)
+	writtenPackets, writeErr := s.packetConnection.WritePackets(rawPackets)
 	if writeErr != nil {
 		return writeErr
+	}
+	if writtenPackets > 0 {
+		s.access.Lock()
+		s.lastOutboundTime = time.Now()
+		s.access.Unlock()
 	}
 	return encodeErr
 }
@@ -221,7 +233,6 @@ func (s *staticKeyClientSession) Close() error {
 }
 
 func (s *staticKeyClientSession) readLoop() {
-	lastInboundTime := time.Now()
 	for {
 		select {
 		case <-s.sessionContext.Done():
@@ -236,9 +247,7 @@ func (s *staticKeyClientSession) readLoop() {
 		}
 		rawPacketBuffers, readErr := s.packetConnection.ReadPackets()
 		decodedPayloads := make([][]byte, 0, len(rawPacketBuffers))
-		if len(rawPacketBuffers) > 0 {
-			lastInboundTime = time.Now()
-		}
+		authenticatedPacketReceived := false
 		for _, rawPacketBuffer := range rawPacketBuffers {
 			packetID, decodedPayload, decodeError := s.dataCodec.Decode(nil, rawPacketBuffer.Bytes())
 			if decodeError != nil {
@@ -248,17 +257,26 @@ func (s *staticKeyClientSession) readLoop() {
 			if s.replayWindow != nil && !s.replayWindow.Accept(packetID) {
 				continue
 			}
+			authenticatedPacketReceived = true
+			if bytes.Equal(decodedPayload, openVPNDataChannelPingPayload) {
+				continue
+			}
 			decodedPayloads = append(decodedPayloads, decodedPayload)
 		}
 		buf.ReleaseMulti(rawPacketBuffers)
+		if authenticatedPacketReceived {
+			s.access.Lock()
+			s.lastInboundTime = time.Now()
+			s.access.Unlock()
+		}
 		s.parent.handleIncomingDataPayloads(decodedPayloads, s.dataCodec, dataTransportHeaderSize(s.remote.remote.Protocol))
+		keepaliveErr := s.checkKeepalive(time.Now())
+		if keepaliveErr != nil {
+			s.finish(keepaliveErr)
+			return
+		}
 		if readErr != nil {
 			if E.IsTimeout(readErr) {
-				pingRestartErr := s.checkPingRestartTimeout(lastInboundTime)
-				if pingRestartErr != nil {
-					s.finish(pingRestartErr)
-					return
-				}
 				continue
 			}
 			if E.IsMulti(readErr, net.ErrClosed) {
@@ -271,18 +289,20 @@ func (s *staticKeyClientSession) readLoop() {
 	}
 }
 
-func (s *staticKeyClientSession) checkPingRestartTimeout(lastInboundTime time.Time) error {
-	if strings.HasPrefix(s.remote.remote.Protocol, "udp") && s.parent.options.Timing.PingRestart == 0 {
-		return nil
+func (s *staticKeyClientSession) checkKeepalive(now time.Time) error {
+	s.access.Lock()
+	lastInboundTime := s.lastInboundTime
+	lastOutboundTime := s.lastOutboundTime
+	s.access.Unlock()
+	pingRestart := s.parent.options.Timing.PingRestart
+	if pingRestart > 0 && !now.Before(lastInboundTime.Add(pingRestart)) {
+		return ErrPingRestartTimeout
 	}
-	if s.parent.options.Timing.PingRestart == 0 {
-		return nil
+	pingInterval := s.parent.options.Timing.PingInterval
+	if pingInterval > 0 && !now.Before(lastOutboundTime.Add(pingInterval)) {
+		return s.WriteDataPackets([][]byte{openVPNDataChannelPingPayload})
 	}
-	deadline := lastInboundTime.Add(s.parent.options.Timing.PingRestart)
-	if time.Now().Before(deadline) {
-		return nil
-	}
-	return ErrPingRestartTimeout
+	return nil
 }
 
 func (s *staticKeyClientSession) setReady(ready bool) {

@@ -36,6 +36,7 @@ type tlsClient struct {
 	access             sync.Mutex
 	ready              bool
 	challengeCancelErr error
+	pushAccess         sync.Mutex
 }
 
 func newTLSClient(parent *Client, useActiveAuthToken bool, remote clientRemote) (*tlsClient, error) {
@@ -173,7 +174,9 @@ func (c *tlsClient) Initialize(ctx context.Context) error {
 	}
 	c.tlsConfiguration = tlsConfiguration
 	var underlyingConnection net.Conn
-	if c.parent.options.Transport.DialContext != nil {
+	if c.parent.options.Transport.DialContextWithAddressIndex != nil {
+		underlyingConnection, err = c.parent.options.Transport.DialContextWithAddressIndex(sessionContext, c.remote.transportNetwork, c.remote.address, c.remote.addressIndex)
+	} else if c.parent.options.Transport.DialContext != nil {
 		underlyingConnection, err = c.parent.options.Transport.DialContext(sessionContext, c.remote.transportNetwork, c.remote.address)
 	} else {
 		underlyingConnection, err = (&net.Dialer{}).DialContext(sessionContext, c.remote.transportNetwork, c.remote.address)
@@ -564,6 +567,7 @@ func (c *tlsClient) runRenegotiation(channel *tlsControlChannel, initiator bool)
 	if handshakeErr != nil {
 		return nil, handshakeErr
 	}
+	channel.setTLSConnection(tlsConnection)
 	clientKeySource, err := generateTLSKeyMethodKeySource(true)
 	if err != nil {
 		return nil, err
@@ -594,7 +598,6 @@ func (c *tlsClient) runRenegotiation(channel *tlsControlChannel, initiator bool)
 	if err != nil {
 		return nil, err
 	}
-	_ = tlsConnection.SetDeadline(time.Time{})
 	remoteSessionID, hasRemoteSessionID := c.sessionManager.RemoteSessionID()
 	if !hasRemoteSessionID {
 		return nil, E.New("missing remote session id for renegotiation")
@@ -614,11 +617,41 @@ func (c *tlsClient) runRenegotiation(channel *tlsControlChannel, initiator bool)
 	if err != nil {
 		return nil, err
 	}
-	return newTLSDataCodec(
+	newCodec, err := newTLSDataCodec(
 		keyMaterial,
 		false,
 		c.remoteSelectedCipher,
 		c.remoteSelectedAuth,
 		c.parent.options.DataChannel.ReplayWindow,
 	)
+	if err != nil {
+		return nil, err
+	}
+	_ = tlsConnection.SetDeadline(time.Time{})
+	go c.renegotiationControlMessageLoop(tlsConnection)
+	return newCodec, nil
+}
+
+// Upstream creates a separate TLS control stream for every soft-reset and may
+// send token-only PUSH_REPLY records on the newly active key state.
+func (c *tlsClient) renegotiationControlMessageLoop(tlsConnection *tls.Conn) {
+	for {
+		select {
+		case <-c.sessionContext.Done():
+			return
+		default:
+		}
+		controlRecord, err := readTLSControlRecord(tlsConnection, time.Second)
+		if err != nil {
+			if E.IsTimeout(err) {
+				continue
+			}
+			return
+		}
+		err = c.dispatchControlDirective(controlRecord)
+		if err != nil {
+			c.finish(err)
+			return
+		}
+	}
 }

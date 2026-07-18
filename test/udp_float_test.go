@@ -26,6 +26,7 @@ func TestTLSUDPPeerIDNATRebindingAndHijackResistance(t *testing.T) {
 			Certificate:          Material{Path: filepath.Join("testdata", "openvpn", "pki", "server.crt")},
 			Key:                  Material{Path: filepath.Join("testdata", "openvpn", "pki", "server.key")},
 		},
+		Authentication: ServerAuthenticationOptions{DuplicateCN: true},
 		Tunnel: ServerTunnelOptions{
 			AddressPools: []netip.Prefix{netip.MustParsePrefix("10.88.0.0/28")},
 			Topology:     "subnet",

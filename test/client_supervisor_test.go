@@ -3,6 +3,7 @@ package test
 import (
 	"bytes"
 	"context"
+	"net"
 	"net/netip"
 	"path/filepath"
 	"testing"
@@ -11,6 +12,74 @@ import (
 	. "github.com/sagernet/sing-openvpn"
 	E "github.com/sagernet/sing/common/exceptions"
 )
+
+func TestClientSupervisorAdvancesResolvedAddressIndex(t *testing.T) {
+	t.Parallel()
+	listenAddress := reserveListenAddressForProtocol(t, "tcp")
+	serverContext, cancelServerContext := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelServerContext()
+	server := startSupervisorTLSServer(t, serverContext, listenAddress)
+	defer server.Close()
+
+	addressIndexes := make(chan int, 4)
+	eventCh := make(chan TunnelConfigurationEvent, 2)
+	clientContext, cancelClientContext := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelClientContext()
+	client, err := NewClient(ClientOptions{
+		Context: clientContext,
+		Mode:    ModeTLS,
+		Transport: ClientTransportOptions{
+			Remotes:  []Remote{{Host: "resolved-address.test", Port: 1194, Protocol: "tcp"}},
+			Protocol: "tcp",
+			DialContextWithAddressIndex: func(ctx context.Context, network string, _ string, addressIndex int) (net.Conn, error) {
+				addressIndexes <- addressIndex
+				if addressIndex == 0 {
+					return nil, E.New("first resolved address unavailable")
+				}
+				if addressIndex > 1 {
+					return nil, ErrRemoteAddressExhausted
+				}
+				return (&net.Dialer{}).DialContext(ctx, network, listenAddress)
+			},
+		},
+		TLS: ClientTLSOptions{
+			CertificateAuthority: Material{Path: filepath.Join("testdata", "openvpn", "pki", "ca.crt")},
+			Certificate:          Material{Path: filepath.Join("testdata", "openvpn", "pki", "client.crt")},
+			Key:                  Material{Path: filepath.Join("testdata", "openvpn", "pki", "client.key")},
+		},
+		Pull: ClientPullOptions{Enabled: true},
+		OnTunnelConfiguration: func(event TunnelConfigurationEvent) error {
+			eventCh <- event
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	err = client.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := waitForSupervisorTunnelConfigurationEvent(t, eventCh, 15*time.Second)
+	if event.Reason != TunnelConfigurationEventInitial {
+		t.Fatalf("unexpected event reason: %s", event.Reason)
+	}
+	for expectedIndex := range 2 {
+		select {
+		case actualIndex := <-addressIndexes:
+			if actualIndex != expectedIndex {
+				t.Fatalf("unexpected resolved address index: got %d, want %d", actualIndex, expectedIndex)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("resolved address index %d was not attempted", expectedIndex)
+		}
+	}
+	err = tryEchoClientThroughServer(client, server, []byte("resolved-address-cursor"), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestClientSupervisorReconnectsTLSSessionAfterTCPDrop(t *testing.T) {
 	t.Parallel()

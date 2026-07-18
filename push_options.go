@@ -34,7 +34,9 @@ func buildPushedOptions(options ServerOptions) pushedOptions {
 		RedirectGateway:      options.Push.RedirectGateway,
 		RedirectGatewayFlags: slices.Clone(options.Push.RedirectGatewayFlags),
 		PingInterval:         options.Push.PingInterval,
+		PingIntervalSet:      options.Push.PingIntervalSet || options.Push.PingInterval > 0,
 		PingRestart:          options.Push.PingRestart,
+		PingRestartSet:       options.Push.PingRestartSet || options.Push.PingRestart > 0,
 	}
 }
 
@@ -110,10 +112,10 @@ func buildPushReplyOptionFields(options pushedOptions) []string {
 	if options.RouteMetric != 0 {
 		pushOptionFields = append(pushOptionFields, "route-metric "+strconv.Itoa(options.RouteMetric))
 	}
-	if options.PingInterval > 0 {
+	if options.PingIntervalSet {
 		pushOptionFields = append(pushOptionFields, "ping "+strconv.FormatInt(int64(options.PingInterval/time.Second), 10))
 	}
-	if options.PingRestart > 0 {
+	if options.PingRestartSet {
 		pushOptionFields = append(pushOptionFields, "ping-restart "+strconv.FormatInt(int64(options.PingRestart/time.Second), 10))
 	}
 	if authToken := strings.TrimSpace(options.AuthToken); authToken != "" {

@@ -54,7 +54,24 @@ func runInteropDirection(t *testing.T, direction interopDirection) {
 				}
 				return
 			}
-			runInteropScenario(scenarioTest, requireInteropEnvironmentVersion(scenarioTest, openVPNInteropDefaultVersion), scenario)
+			versions := []string{openVPNInteropDefaultVersion}
+			if scenario.LegacyServerMatrix {
+				versions = []string{"2.4.12", "2.5.11", "2.6.14"}
+			}
+			runCount := 0
+			for _, version := range versions {
+				if !interopScenarioSupportsVersion(scenario, version) {
+					continue
+				}
+				runCount++
+				scenarioTest.Run("openvpn_"+version, func(versionTest *testing.T) {
+					env := requireInteropEnvironmentVersion(versionTest, version)
+					runInteropScenario(versionTest, env, scenario)
+				})
+			}
+			if runCount == 0 {
+				scenarioTest.Fatal("scenario has no supported OpenVPN client version")
+			}
 		})
 	}
 }
@@ -130,19 +147,20 @@ func runStaticClientToRealServerScenario(t *testing.T, env interopEnvironment, s
 		serverReady = []string{"UDPv4 link remote", "UDPv6 link remote"}
 	}
 	renderInteropTemplate(t, "static-peer.conf.tmpl", filepath.Join(workspace.renderedDir, "server-static.conf"), staticPeerTemplateData{
-		Protocol:     serverProtocol,
-		LocalHost:    "0.0.0.0",
-		LocalPort:    serverPort,
-		RemoteHost:   staticInteropRemoteHost(scenario.Protocol, "host.docker.internal"),
-		RemotePort:   clientPort,
-		UseFloat:     !strings.HasPrefix(scenario.Protocol, "tcp"),
-		TunnelLocal:  "10.1.0.1",
-		TunnelRemote: "10.1.0.2",
-		SecretPath:   filepath.ToSlash(filepath.Join(openVPNInteropRoot, "fixtures", "static.key")),
-		KeyDirection: serverKeyDirection,
-		Cipher:       scenario.Cipher,
-		Auth:         scenario.Auth,
-		LogPath:      filepath.ToSlash(filepath.Join(openVPNInteropRoot, "logs", "server.log")),
+		Protocol:        serverProtocol,
+		LocalHost:       "0.0.0.0",
+		LocalPort:       serverPort,
+		RemoteHost:      staticInteropRemoteHost(scenario.Protocol, "host.docker.internal"),
+		RemotePort:      clientPort,
+		UseFloat:        !strings.HasPrefix(scenario.Protocol, "tcp"),
+		TunnelLocal:     "10.1.0.1",
+		TunnelRemote:    "10.1.0.2",
+		SecretPath:      filepath.ToSlash(filepath.Join(openVPNInteropRoot, "fixtures", "static.key")),
+		KeyDirection:    serverKeyDirection,
+		Cipher:          scenario.Cipher,
+		Auth:            scenario.Auth,
+		LogPath:         filepath.ToSlash(filepath.Join(openVPNInteropRoot, "logs", "server.log")),
+		PingExitSeconds: int64(scenario.ServerPingExit / time.Second),
 	})
 	startInteropContainer(t, env.docker, dockerContainerOptions{
 		Name:         "sing-openvpn-real-server-" + sanitizeDockerName(t.Name()),
@@ -168,6 +186,7 @@ func runStaticClientToRealServerScenario(t *testing.T, env interopEnvironment, s
 			Cipher: scenario.Cipher,
 			Auth:   scenario.Auth,
 		},
+		Timing:       openvpn.ClientTimingOptions{PingInterval: scenario.ClientPingInterval},
 		StaticKey:    openvpn.Material{Path: filepath.Join("testdata", "openvpn", "pki", "static.key")},
 		KeyDirection: clientKeyDirection,
 	}
@@ -179,6 +198,9 @@ func runStaticClientToRealServerScenario(t *testing.T, env interopEnvironment, s
 	err = client.Start()
 	if err != nil {
 		t.Fatalf("start client: %v", err)
+	}
+	if scenario.InitialIdle > 0 {
+		time.Sleep(scenario.InitialIdle)
 	}
 	sourceAddress := netip.MustParseAddr("10.1.0.2")
 	destinationAddress := netip.MustParseAddr("10.1.0.1")
@@ -282,6 +304,7 @@ func runTLSClientToRealServerScenario(t *testing.T, env interopEnvironment, scen
 	if scenario.TLSCryptV2ForceCookie {
 		tlsCryptV2Option = "force-cookie"
 	}
+	pushLines := append(pushLinesForScenario(scenario.PushConfiguration), scenario.AdditionalPushLines...)
 	renderInteropTemplate(t, "tls-server.conf.tmpl", filepath.Join(workspace.renderedDir, "server-tls.conf"), tlsServerTemplateData{
 		Protocol:             scenario.Protocol,
 		Port:                 serverPort,
@@ -303,7 +326,7 @@ func runTLSClientToRealServerScenario(t *testing.T, env interopEnvironment, scen
 		RenegotiationSeconds: int64(scenario.RenegotiationInterval / time.Second),
 		RequireUserPass:      scenario.UseAuthUserPass,
 		AuthScriptPath:       filepath.ToSlash(filepath.Join(openVPNInteropRoot, "scripts", "check_userpass.sh")),
-		PushLines:            pushLinesForScenario(scenario.PushConfiguration),
+		PushLines:            pushLines,
 		LogPath:              filepath.ToSlash(filepath.Join(openVPNInteropRoot, "logs", "server.log")),
 	})
 	serverContainer := startInteropContainer(t, env.docker, dockerContainerOptions{
@@ -347,6 +370,7 @@ func runTLSClientToRealServerScenario(t *testing.T, env interopEnvironment, scen
 		Authentication: openvpn.ClientAuthenticationOptions{Username: "test-user", Password: "test-password"},
 		Pull: openvpn.ClientPullOptions{
 			Enabled:     true,
+			Filters:     slices.Clone(scenario.PullFilters),
 			RouteNoPull: scenario.RouteNoPull,
 		},
 		Timing: openvpn.ClientTimingOptions{
@@ -506,15 +530,25 @@ func assertExpectedTunnelConfiguration(t *testing.T, scenario interopScenario, o
 	if expected.SelectedCipher != "" && interopVersionRank(openVPNVersion) >= 25 && actual.SelectedCipher != expected.SelectedCipher {
 		t.Fatalf("expected negotiated data cipher %q, got %q", expected.SelectedCipher, actual.SelectedCipher)
 	}
+	if scenario.CheckPingTimeoutAction &&
+		(actual.PingRestart != expected.PingRestart || actual.PingExit != expected.PingExit) {
+		t.Fatalf(
+			"expected pushed ping timeout action restart=%s exit=%s, got restart=%s exit=%s",
+			expected.PingRestart,
+			expected.PingExit,
+			actual.PingRestart,
+			actual.PingExit,
+		)
+	}
 	if scenario.RouteNoPull {
-		if actual.RouteGateway.IsValid() {
-			t.Fatalf("route-nopull retained pushed route gateway %s", actual.RouteGateway)
-		}
 		if len(actual.IPv4Routes) != 0 || len(actual.IPv6Routes) != 0 {
 			t.Fatalf("route-nopull retained pushed routes: IPv4=%v IPv6=%v", actual.IPv4Routes, actual.IPv6Routes)
 		}
 		if actual.RedirectGateway || actual.RedirectPrivate {
 			t.Fatalf("route-nopull retained pushed redirect: gateway=%t private=%t", actual.RedirectGateway, actual.RedirectPrivate)
+		}
+		if actual.BlockIPv6 || actual.BlockOutsideDNS || len(actual.DNS) != 0 || len(actual.DHCPOptions) != 0 {
+			t.Fatalf("route-nopull retained pushed DNS/block options: DNS=%v DHCP=%v block-ipv6=%t block-outside-dns=%t", actual.DNS, actual.DHCPOptions, actual.BlockIPv6, actual.BlockOutsideDNS)
 		}
 	}
 }
@@ -646,6 +680,7 @@ func runTLSRealClientToRepoServerScenario(t *testing.T, env interopEnvironment, 
 	}
 	if scenario.UseTLSCryptV2 {
 		serverOptions.TLS.CryptV2 = openvpn.Material{Path: filepath.Join("testdata", "openvpn", "pki", "tls-crypt-v2-server.key")}
+		serverOptions.TLS.CryptV2ForceCookie = scenario.TLSCryptV2ForceCookie
 	}
 	server, err := openvpn.NewServer(serverOptions)
 	if err != nil {

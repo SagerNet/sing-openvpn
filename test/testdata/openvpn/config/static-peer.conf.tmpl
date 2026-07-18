@@ -25,4 +25,7 @@ auth {{ .Auth }}
 {{- if .ExplicitNotify }}
 explicit-exit-notify 1
 {{- end }}
+{{- if gt .PingExitSeconds 0 }}
+ping-exit {{ .PingExitSeconds }}
+{{- end }}
 log {{ .LogPath }}

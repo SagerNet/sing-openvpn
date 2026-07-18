@@ -15,6 +15,8 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
+const serverScheduledExitInterval = 5 * time.Second
+
 type tlsServerSession struct {
 	*tlsPeerSession
 	server              *tlsServer
@@ -34,13 +36,19 @@ type tlsServerSession struct {
 	closeRequestOnce    sync.Once
 	closeRequestErr     error
 
-	renegotiationAccess      sync.Mutex
-	renegotiationBudget      dataRenegotiationBudget
-	renegotiationInterval    time.Duration
-	renegotiationDeadline    time.Time
-	renegotiationInProgress  bool
-	authenticatedUsername    string
-	authenticatedUsernameSet bool
+	renegotiationAccess          sync.Mutex
+	renegotiationBudget          dataRenegotiationBudget
+	renegotiationInterval        time.Duration
+	renegotiationDeadline        time.Time
+	renegotiationInProgress      bool
+	authenticatedUsername        string
+	authenticatedUsernameSet     bool
+	handshakeDeadline            time.Time
+	clientCertificateIdentity    *tlsClientCertificateIdentity
+	clientCertificateIdentitySet bool
+	authenticatedIdentity        string
+	finishOnce                   sync.Once
+	finishDone                   chan struct{}
 }
 
 func (s *tlsServer) newSession(packetConnection proto.PacketConnection, reservation *serverResourceReservation) *tlsServerSession {
@@ -55,6 +63,8 @@ func (s *tlsServer) newSession(packetConnection proto.PacketConnection, reservat
 		sessionContext:      sessionContext,
 		cancelSession:       cancelSession,
 		resourceReservation: reservation,
+		handshakeDeadline:   time.Now().Add(s.parent.options.Timing.HandWindow),
+		finishDone:          make(chan struct{}),
 	}
 	session.roleCallbacks = tlsRoleCallbacks{
 		// Upstream generate_key_expansion orders the client session ID before the server session ID.
@@ -134,8 +144,11 @@ func (s *tlsServerSession) Close() error {
 }
 
 func (s *tlsServerSession) finish() {
-	_ = s.Close()
-	_ = s.tlsPeerSession.Close()
+	s.finishOnce.Do(func() {
+		_ = s.Close()
+		_ = s.tlsPeerSession.Close()
+		close(s.finishDone)
+	})
 }
 
 func (s *tlsServerSession) runWithClientReset(clientResetPacket *proto.Packet, protection tlsControlProtection) error {
@@ -148,6 +161,11 @@ func (s *tlsServerSession) runWithClientReset(clientResetPacket *proto.Packet, p
 		return err
 	}
 	s.sessionManager.SetRemoteSessionID(clientResetPacket.LocalSessionID)
+	if _, isUDP := s.packetConnection.(*udpPeerPacketConnection); isUDP {
+		s.setAuthenticatedDataPacketObserver(func() bool {
+			return s.server.commitAuthenticatedUDPAddress(s)
+		})
+	}
 	serverResetPacket, err := s.sessionManager.NewHardResetServerV2Packet([]proto.PacketID{clientResetPacket.ID})
 	if err != nil {
 		return err
@@ -190,7 +208,10 @@ func (s *tlsServerSession) runTLSHandshake(initialControlPacket *proto.Packet) e
 	if !s.installInitialControlChannel(controlChannel, tlsConnection) {
 		return net.ErrClosed
 	}
-	err := tlsConnection.SetDeadline(time.Now().Add(10 * time.Second))
+	if !time.Now().Before(s.handshakeDeadline) {
+		return ErrHandshakeTimeout
+	}
+	err := tlsConnection.SetDeadline(s.handshakeDeadline)
 	if err != nil {
 		return err
 	}
@@ -198,9 +219,14 @@ func (s *tlsServerSession) runTLSHandshake(initialControlPacket *proto.Packet) e
 	if err != nil {
 		return err
 	}
+	s.lockInitialCertificateIdentity(tlsConnection)
 	_ = tlsConnection.SetDeadline(time.Time{})
 
-	clientKeyMethodRecord, err := readTLSControlRecord(s.tlsConnection, 5*time.Second)
+	remainingHandshakeWindow := time.Until(s.handshakeDeadline)
+	if remainingHandshakeWindow <= 0 {
+		return ErrHandshakeTimeout
+	}
+	clientKeyMethodRecord, err := readTLSControlRecord(s.tlsConnection, remainingHandshakeWindow)
 	if err != nil {
 		return err
 	}
@@ -285,25 +311,51 @@ func (s *tlsServerSession) runTLSHandshake(initialControlPacket *proto.Packet) e
 		return err
 	}
 	s.configureRenegotiation()
+	s.installInitialDataCodec(initialCodec, s.sessionManager.CurrentKeyID())
+	err = s.server.registerAuthenticatedIdentity(s)
+	if err != nil {
+		return err
+	}
+	s.resourceReservation.establish()
+	pinger := &tlsServerPinger{
+		session:      s,
+		pingInterval: s.server.parent.options.Timing.PingInterval,
+		pingRestart:  s.server.parent.options.Timing.PingRestart,
+	}
+	pingEnabled := pinger.pingInterval > 0 || pinger.pingRestart > 0
+	var readActivityObserver func()
+	var writeActivityObserver func()
+	if pingEnabled {
+		readActivityObserver = func() { pinger.markActivity(true, false) }
+		writeActivityObserver = func() { pinger.markActivity(false, true) }
+		pinger.markActivity(true, true)
+		s.controlChannel.setActivityObservers(readActivityObserver, writeActivityObserver)
+	}
 	s.setDataObservers(
 		s.consumeRenegotiationBudget,
-		nil,
+		readActivityObserver,
 		func(payloadBytes int) { _ = s.consumeRenegotiationBudget(0, payloadBytes) },
-		nil,
+		writeActivityObserver,
 		nil,
 	)
-	s.installInitialDataCodec(initialCodec, s.sessionManager.CurrentKeyID())
-	s.resourceReservation.establish()
-	renegotiationContext, cancelRenegotiation := context.WithCancel(s.sessionContext)
-	defer cancelRenegotiation()
-	renegotiationLoopDone := make(chan struct{})
+	sessionLoopContext, cancelSessionLoops := context.WithCancel(s.sessionContext)
+	defer cancelSessionLoops()
+	var sessionLoopWaitGroup sync.WaitGroup
+	sessionLoopWaitGroup.Add(1)
 	go func() {
-		defer close(renegotiationLoopDone)
-		s.runRenegotiationLoop(renegotiationContext)
+		defer sessionLoopWaitGroup.Done()
+		s.runRenegotiationLoop(sessionLoopContext)
 	}()
+	if pingEnabled {
+		sessionLoopWaitGroup.Add(1)
+		go func() {
+			defer sessionLoopWaitGroup.Done()
+			pinger.runLoop(sessionLoopContext)
+		}()
+	}
 	controlLoopErr := s.runControlLoop()
-	cancelRenegotiation()
-	<-renegotiationLoopDone
+	cancelSessionLoops()
+	sessionLoopWaitGroup.Wait()
 	return controlLoopErr
 }
 
@@ -315,7 +367,7 @@ func (s *tlsServerSession) readClientReset(initialPacket []byte) (*proto.Packet,
 	if len(initialPacket) > 0 {
 		rawPacket = append([]byte{}, initialPacket...)
 	} else {
-		err = s.packetConnection.SetReadDeadline(time.Now().Add(10 * time.Second))
+		err = s.packetConnection.SetReadDeadline(s.handshakeDeadline)
 		if err != nil {
 			return nil, tlsControlProtection{}, err
 		}
@@ -420,6 +472,7 @@ func (s *tlsServerSession) runControlLoop() error {
 				if err != nil {
 					return err
 				}
+				s.controlChannel.waitForReliableDelivery(serverScheduledExitInterval)
 				return ErrAuthenticationFailed
 			}
 			err = s.allocateAndRegisterTunnelAddress()
@@ -433,7 +486,11 @@ func (s *tlsServerSession) runControlLoop() error {
 			if s.server.parent.ipPool != nil && s.server.parent.ipPool.HasIPv4() {
 				serverIPv4 = s.server.parent.ipPool.ServerIPv4()
 			}
-			for _, payload := range buildServerPushReplyPayloadsWithOverrides(s.server.parent.options, s.peerInfo, s.selectedCipher, pushPeerID, pushLocalAddressOverride, pushLocalAddressIPv6Override, serverIPv4) {
+			pushPayloads, pushErr := buildServerPushReplyPayloadsWithOverrides(s.server.parent.options, s.peerInfo, s.selectedCipher, pushPeerID, pushLocalAddressOverride, pushLocalAddressIPv6Override, serverIPv4)
+			if pushErr != nil {
+				return pushErr
+			}
+			for _, payload := range pushPayloads {
 				_, err = s.tlsConnection.Write(tlsControlStringPayload(payload))
 				if err != nil {
 					return err

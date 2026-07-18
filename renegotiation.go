@@ -199,14 +199,11 @@ func (s *tlsPeerSession) finishSoftReset(state *tlsRenegotiationState, codec dat
 			channelsToClose = append(channelsToClose, state.channel)
 		} else {
 			negotiated = true
-			if s.role == tlsRoleServer && !state.peerDataConfirmed {
-				state.status = tlsRenegotiationAwaitingData
-				state.expiresAt = time.Now().Add(tlsTransitionWindow)
-				s.installDataKeyState(codec, state.keyID, state.sessionManager, state.sequence, false)
-				s.armKeyStateExpiryLocked(state)
-			} else {
-				s.promoteKeyStateLocked(state, codec)
-			}
+			// Upstream selects the newly generated primary key for outbound
+			// data immediately.  Receiving a data packet with the new key is
+			// not a prerequisite; the previous key remains receive-capable as
+			// a lame duck for the transition window.
+			s.promoteKeyStateLocked(state, codec)
 			state.resultErr = nil
 			channelsToClose = append(channelsToClose, s.pruneRenegotiationsLocked(time.Now())...)
 		}

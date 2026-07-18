@@ -130,17 +130,9 @@ func (k *tlsClientKeepalive) snapshotInactivityReset() time.Time {
 
 func (k *tlsClientKeepalive) refreshFromTunnelConfiguration() {
 	tunnelConfiguration := k.parent.TunnelConfiguration()
-	pingInterval := tunnelConfiguration.PingInterval
-	pingRestart := tunnelConfiguration.PingRestart
-	if pingInterval == 0 && k.parent.options.Timing.PingInterval > 0 {
-		pingInterval = k.parent.options.Timing.PingInterval
-	}
-	if pingRestart == 0 && k.parent.options.Timing.PingRestart > 0 {
-		pingRestart = k.parent.options.Timing.PingRestart
-	}
 	k.setDurations(
-		pingInterval,
-		pingRestart,
+		tunnelConfiguration.PingInterval,
+		tunnelConfiguration.PingRestart,
 	)
 }
 
@@ -173,7 +165,7 @@ func (k *tlsClientKeepalive) runLoop() {
 		case <-ticker.C:
 		}
 		k.refreshFromTunnelConfiguration()
-		pingInterval, pingRestart := k.currentDurations()
+		pingInterval, _ := k.currentDurations()
 		tunnelConfiguration := k.parent.TunnelConfiguration()
 		sessionTimeout := tunnelConfiguration.SessionTimeout
 		inactiveTimeout := tunnelConfiguration.InactiveTimeout
@@ -194,9 +186,13 @@ func (k *tlsClientKeepalive) runLoop() {
 			k.session.finish(ErrInactiveTimeout)
 			return
 		}
-		pingExit := tunnelConfiguration.PingExit
-		if shouldExitForPingTimeout(lastInbound, now, pingRestart, pingExit) {
-			k.session.finish(ErrPingRestartTimeout)
+		pingReceiveTimeout, pingTimeoutAction := effectiveClientPingTimeout(tunnelConfiguration)
+		if shouldExitForPingTimeout(lastInbound, now, pingReceiveTimeout) {
+			if pingTimeoutAction == clientPingTimeoutExit {
+				k.session.finish(ErrPingExitTimeout)
+			} else {
+				k.session.finish(ErrPingRestartTimeout)
+			}
 			return
 		}
 		if pingInterval > 0 && (lastOutbound.IsZero() || now.Sub(lastOutbound) >= pingInterval) {

@@ -75,7 +75,13 @@ func peerInfoNCPVersion(peerInfo string) int {
 	return 0
 }
 
-func buildServerPushReplyPayloadsWithOverrides(options ServerOptions, peerInfo string, selectedCipher string, peerID *uint32, ifconfigOverride pushedLocalAddress, ifconfigIPv6Override pushedLocalAddress, serverIPv4 netip.Addr) [][]byte {
+const (
+	serverPushBundleSize     = 1024
+	serverPushBundleOverhead = 84
+	serverPushSafeCapacity   = serverPushBundleSize - serverPushBundleOverhead
+)
+
+func buildServerPushReplyPayloadsWithOverrides(options ServerOptions, peerInfo string, selectedCipher string, peerID *uint32, ifconfigOverride pushedLocalAddress, ifconfigIPv6Override pushedLocalAddress, serverIPv4 netip.Addr) ([][]byte, error) {
 	serverPushOptions := buildPushedOptions(options)
 	if _, supportsPushMTU := peerInfoMTU(peerInfo); !supportsPushMTU {
 		serverPushOptions.TunMTU = 0
@@ -119,10 +125,35 @@ func buildServerPushReplyPayloadsWithOverrides(options ServerOptions, peerInfo s
 	} else if supportsTLSKeyExport {
 		fields = append(fields, "key-derivation tls-ekm")
 	}
-	if len(fields) == 0 {
-		return nil
+	return splitServerPushReplyFields(fields)
+}
+
+func splitServerPushReplyFields(fields []string) ([][]byte, error) {
+	if len(fields) == 0 || fields[0] != pushReplyPayloadPrefix {
+		return nil, E.New("invalid OpenVPN push reply fields")
 	}
-	return [][]byte{[]byte(strings.Join(fields, ","))}
+	current := pushReplyPayloadPrefix
+	multiPush := false
+	payloads := make([][]byte, 0, 1)
+	for _, field := range fields[1:] {
+		addition := "," + field
+		if len(current)+len(addition) >= serverPushSafeCapacity {
+			if current == pushReplyPayloadPrefix {
+				return nil, E.New("OpenVPN push option is too long: ", field)
+			}
+			payloads = append(payloads, []byte(current+",push-continuation 2"))
+			current = pushReplyPayloadPrefix
+			multiPush = true
+		}
+		if len(current)+len(addition) >= serverPushSafeCapacity {
+			return nil, E.New("OpenVPN push option is too long: ", field)
+		}
+		current += addition
+	}
+	if multiPush {
+		current += ",push-continuation 1"
+	}
+	return append(payloads, []byte(current)), nil
 }
 
 func appendUniquePushedRoutes(routes []pushedRoute, route TunnelRoute) []pushedRoute {

@@ -1,6 +1,7 @@
 package openvpn
 
 import (
+	"crypto/tls"
 	"net"
 	"os"
 	"sync"
@@ -41,12 +42,29 @@ type tlsControlChannel struct {
 	deadlineAccess   sync.Mutex
 	readDeadline     time.Time
 	writeDeadline    time.Time
+	activityAccess   sync.RWMutex
+	readActivity     func()
+	writeActivity    func()
+	tlsAccess        sync.RWMutex
+	tlsConnection    *tls.Conn
 
 	// Upstream tls_pre_decrypt keeps every live key_state addressable by
 	// key_id.  The root channel remains the sole packet reader and dispatches
 	// packets to the reliable/TLS channel which owns that key-id.
 	renegotiationAccess   sync.Mutex
 	renegotiationChannels map[uint8]*tlsControlChannel
+}
+
+func (c *tlsControlChannel) setTLSConnection(connection *tls.Conn) {
+	c.tlsAccess.Lock()
+	c.tlsConnection = connection
+	c.tlsAccess.Unlock()
+}
+
+func (c *tlsControlChannel) currentTLSConnection() *tls.Conn {
+	c.tlsAccess.RLock()
+	defer c.tlsAccess.RUnlock()
+	return c.tlsConnection
 }
 
 func newTLSControlChannel(
@@ -76,6 +94,8 @@ func (c *tlsControlChannel) registerRenegotiationChannel(keyID uint8, channel *t
 	if keyID == 0 || keyID > proto.KeyIDMaxValue || channel == nil {
 		return false
 	}
+	readActivity, writeActivity := c.activityObservers()
+	channel.setActivityObservers(readActivity, writeActivity)
 	c.renegotiationAccess.Lock()
 	defer c.renegotiationAccess.Unlock()
 	if _, loaded := c.renegotiationChannels[keyID]; loaded {
@@ -83,6 +103,42 @@ func (c *tlsControlChannel) registerRenegotiationChannel(keyID uint8, channel *t
 	}
 	c.renegotiationChannels[keyID] = channel
 	return true
+}
+
+func (c *tlsControlChannel) setActivityObservers(readActivity func(), writeActivity func()) {
+	c.activityAccess.Lock()
+	c.readActivity = readActivity
+	c.writeActivity = writeActivity
+	c.activityAccess.Unlock()
+	c.renegotiationAccess.Lock()
+	children := make([]*tlsControlChannel, 0, len(c.renegotiationChannels))
+	for _, child := range c.renegotiationChannels {
+		children = append(children, child)
+	}
+	c.renegotiationAccess.Unlock()
+	for _, child := range children {
+		child.setActivityObservers(readActivity, writeActivity)
+	}
+}
+
+func (c *tlsControlChannel) activityObservers() (func(), func()) {
+	c.activityAccess.RLock()
+	defer c.activityAccess.RUnlock()
+	return c.readActivity, c.writeActivity
+}
+
+func (c *tlsControlChannel) markReadActivity() {
+	readActivity, _ := c.activityObservers()
+	if readActivity != nil {
+		readActivity()
+	}
+}
+
+func (c *tlsControlChannel) markWriteActivity() {
+	_, writeActivity := c.activityObservers()
+	if writeActivity != nil {
+		writeActivity()
+	}
 }
 
 func (c *tlsControlChannel) unregisterRenegotiationChannel(keyID uint8, channel *tlsControlChannel) {
@@ -202,6 +258,26 @@ func (c *tlsControlChannel) Write(buffer []byte) (int, error) {
 		buffer = buffer[chunkSize:]
 	}
 	return totalWritten, nil
+}
+
+func (c *tlsControlChannel) waitForReliableDelivery(timeout time.Duration) bool {
+	if timeout <= 0 {
+		return !c.outgoing.HasInFlightPackets()
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for c.outgoing.HasInFlightPackets() {
+		select {
+		case <-c.closed:
+			return false
+		case <-timer.C:
+			return false
+		case <-ticker.C:
+		}
+	}
+	return true
 }
 
 // Upstream session_move_pre_start sends the soft-reset initial_opcode as
@@ -348,6 +424,7 @@ func (c *tlsControlChannel) processIncomingControlPacket(packet *proto.Packet) b
 			return true
 		}
 		c.outgoing.OnIncomingPacket(packet)
+		c.markReadActivity()
 		if c.onHardReset != nil {
 			c.onHardReset(packet)
 		}
@@ -358,9 +435,11 @@ func (c *tlsControlChannel) processIncomingControlPacket(packet *proto.Packet) b
 			return true
 		}
 		if c.onSoftReset != nil {
+			c.markReadActivity()
 			c.onSoftReset(packet)
 		} else {
 			c.outgoing.OnIncomingPacket(packet)
+			c.markReadActivity()
 		}
 		return true
 	}
@@ -371,6 +450,7 @@ func (c *tlsControlChannel) processIncomingControlPacket(packet *proto.Packet) b
 		return true
 	}
 	c.outgoing.OnIncomingPacket(packet)
+	c.markReadActivity()
 	if packet.Opcode == proto.OpcodeAcknowledgmentV1 {
 		return true
 	}
@@ -474,7 +554,11 @@ func (c *tlsControlChannel) writePacket(packet *proto.Packet) error {
 	if c.shouldSendWrappedClientKey(outgoingPacket) {
 		rawPacket = appendTLSCryptV2WrappedClientKey(rawPacket, c.wrappedClientKey, outgoingPacket.Opcode)
 	}
-	return c.packetConnection.WritePacket(rawPacket)
+	err = c.packetConnection.WritePacket(rawPacket)
+	if err == nil {
+		c.markWriteActivity()
+	}
+	return err
 }
 
 func (c *tlsControlChannel) shouldSendWrappedClientKey(packet *proto.Packet) bool {

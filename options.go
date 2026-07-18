@@ -49,16 +49,18 @@ type TunnelConfigurationEvent struct {
 type UserPassAuthenticator func(ctx context.Context, username string, password string) error
 
 type ClientTransportOptions struct {
-	Remotes            []Remote
-	RemoteRandom       bool
-	DialContext        func(ctx context.Context, network string, address string) (net.Conn, error)
-	Protocol           string
-	ExplicitExitNotify uint32
+	Remotes                     []Remote
+	RemoteRandom                bool
+	DialContext                 func(ctx context.Context, network string, address string) (net.Conn, error)
+	DialContextWithAddressIndex func(ctx context.Context, network string, address string, addressIndex int) (net.Conn, error)
+	Protocol                    string
+	ExplicitExitNotify          uint32
 }
 
 type ClientDataChannelOptions struct {
 	MTU              uint32
 	MSSFix           uint32
+	MSSFixSet        bool
 	Fragment         uint32
 	Cipher           string
 	Ciphers          []string
@@ -125,13 +127,15 @@ type ClientTunnelOptions struct {
 }
 
 type ClientTimingOptions struct {
-	RenegotiationInterval time.Duration
-	RenegotiationBytes    uint64
-	RenegotiationPackets  uint64
-	PingInterval          time.Duration
-	PingRestart           time.Duration
-	TLSTimeout            time.Duration
-	HandWindow            time.Duration
+	RenegotiationInterval    time.Duration
+	RenegotiationIntervalSet bool
+	RenegotiationBytes       uint64
+	RenegotiationPackets     uint64
+	PingInterval             time.Duration
+	PingRestart              time.Duration
+	PingRestartSet           bool
+	TLSTimeout               time.Duration
+	HandWindow               time.Duration
 }
 
 type ClientOptions struct {
@@ -176,15 +180,21 @@ type ServerTLSOptions struct {
 	Auth                    Material
 	Crypt                   Material
 	CryptV2                 Material
+	CryptV2ForceCookie      bool
 	VerifyClientCertificate string
 }
 
 type ServerAuthenticationOptions struct {
 	Authenticator UserPassAuthenticator
+	DuplicateCN   bool
 }
 
 type ServerTimingOptions struct {
-	RenegotiationInterval time.Duration
+	RenegotiationInterval    time.Duration
+	RenegotiationIntervalSet bool
+	HandWindow               time.Duration
+	PingInterval             time.Duration
+	PingRestart              time.Duration
 }
 
 type ServerTunnelOptions struct {
@@ -198,7 +208,9 @@ type ServerPushOptions struct {
 	DNS                  []netip.Addr
 	BlockOutsideDNS      bool
 	PingInterval         time.Duration
+	PingIntervalSet      bool
 	PingRestart          time.Duration
+	PingRestartSet       bool
 	RedirectGateway      bool
 	RedirectGatewayFlags []string
 }

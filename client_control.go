@@ -23,12 +23,20 @@ func (c *tlsClient) pullConfigurationAndCipher() (string, string, error) {
 	var accumulatedPushReplyFields []string
 	pushContinuationPending := false
 	authenticationPending := false
-	deadline := time.Now().Add(c.parent.options.Timing.HandWindow)
-	nextPushRequest := time.Now().Add(tlsPushRequestResendInterval)
+	now := time.Now()
+	deadline := now.Add(c.parent.options.Timing.HandWindow)
+	nextPushRequest := now.Add(tlsPushRequestResendInterval)
+	lastInboundTime := now
+	pingRestart := c.prePullPingRestart()
 	for time.Now().Before(deadline) {
 		readTimeout := time.Until(deadline)
 		if resendTimeout := time.Until(nextPushRequest); resendTimeout < readTimeout {
 			readTimeout = resendTimeout
+		}
+		if pingRestart > 0 {
+			if pingTimeout := time.Until(lastInboundTime.Add(pingRestart)); pingTimeout < readTimeout {
+				readTimeout = pingTimeout
+			}
 		}
 		if readTimeout <= 0 {
 			readTimeout = time.Millisecond
@@ -42,15 +50,20 @@ func (c *tlsClient) pullConfigurationAndCipher() (string, string, error) {
 			if !E.IsTimeout(readErr) {
 				return "", "", readErr
 			}
-			if !time.Now().Before(nextPushRequest) {
+			now = time.Now()
+			if pingRestart > 0 && !now.Before(lastInboundTime.Add(pingRestart)) {
+				return "", "", ErrPingRestartTimeout
+			}
+			if !now.Before(nextPushRequest) {
 				_, writeErr = c.tlsConnection.Write(append([]byte(pushRequestPayload), 0))
 				if writeErr != nil {
 					return "", "", writeErr
 				}
-				nextPushRequest = time.Now().Add(tlsPushRequestResendInterval)
+				nextPushRequest = now.Add(tlsPushRequestResendInterval)
 			}
 			continue
 		}
+		lastInboundTime = time.Now()
 		switch classifyTLSControlDirective(controlRecord) {
 		case tlsControlDirectiveAuthFailed:
 			return "", "", c.authFailedError(controlRecord)
@@ -60,7 +73,7 @@ func (c *tlsClient) pullConfigurationAndCipher() (string, string, error) {
 			c.parent.updateChallengeDeadline(c, deadline)
 			continue
 		case tlsControlDirectiveRestart:
-			return "", "", ErrServerRestart
+			return "", "", newServerRestartError(controlRecord)
 		case tlsControlDirectiveHalt:
 			return "", "", ErrServerHalt
 		case tlsControlDirectiveExit:
@@ -72,7 +85,6 @@ func (c *tlsClient) pullConfigurationAndCipher() (string, string, error) {
 			continue
 		case tlsControlDirectivePushReply:
 			accumulatedFields, continuation, decoded := appendPushReplyPayloadSegment(accumulatedPushReplyFields, controlRecord)
-			pushReplyPayload := controlRecord
 			var decodedPushedOptions pushedOptions
 			if decoded {
 				accumulatedPushReplyFields = accumulatedFields
@@ -80,37 +92,23 @@ func (c *tlsClient) pullConfigurationAndCipher() (string, string, error) {
 				if pushContinuationPending {
 					continue
 				}
-				pushReplyPayload = []byte(strings.Join(accumulatedPushReplyFields, ","))
+				pushReplyPayload := []byte(strings.Join(accumulatedPushReplyFields, ","))
 				accumulatedPushReplyFields = nil
-				decodedPushedOptions, _, decoded = decodePushReplyPayload(pushReplyPayload, c.remoteTransportAddress())
+				decodedPushedOptions, _, decoded = decodePushReplyPayloadWithFilters(pushReplyPayload, c.remoteTransportAddress(), c.parent.options.Pull.Filters)
 			} else {
-				decodedPushedOptions, continuation, decoded = decodePushReplyPayload(controlRecord, c.remoteTransportAddress())
+				decodedPushedOptions, continuation, decoded = decodePushReplyPayloadWithFilters(controlRecord, c.remoteTransportAddress(), c.parent.options.Pull.Filters)
 				pushContinuationPending = continuation == 2
 			}
 			if !decoded || pushContinuationPending {
 				continue
 			}
-			c.parent.applyPushedOptions(decodedPushedOptions)
-			pullFilterRejection := c.parent.PullFilterRejection()
-			if pullFilterRejection != "" {
-				return "", "", ErrPullFilterRejected
-			}
-			compressionPushRejection := c.parent.CompressionPushRejection()
-			if compressionPushRejection != "" {
-				return "", "", ErrCompressionPushRejected
-			}
-			if decodedPushedOptions.PeerID != nil {
-				c.setPeerID(decodedPushedOptions.PeerID)
+			applyErr := c.applyDecodedPushedOptions(decodedPushedOptions)
+			if applyErr != nil {
+				return "", "", applyErr
 			}
 			if decodedPushedOptions.SelectedCipher != "" {
 				selectedCipher = decodedPushedOptions.SelectedCipher
 				pushedCipherSeen = true
-			} else {
-				pushedCipher := parsePushedCipher(pushReplyPayload)
-				if pushedCipher != "" {
-					selectedCipher = pushedCipher
-					pushedCipherSeen = true
-				}
 			}
 			if decodedPushedOptions.SelectedAuth != "" {
 				selectedAuth = decodedPushedOptions.SelectedAuth
@@ -131,16 +129,9 @@ func (c *tlsClient) pullConfigurationAndCipher() (string, string, error) {
 		return "", "", ErrAuthPendingTimeout
 	}
 	if pushContinuationPending {
-		return "", "", E.Extend(ErrHandshakeTimeout, "incomplete push continuation")
+		return "", "", E.Extend(ErrNoPushReply, "incomplete push continuation")
 	}
-	if !pushedCipherSeen {
-		resolvedCipher, err := applyCipherNegotiationFallback(c.parent.options, c.remoteCipherName)
-		if err != nil {
-			return "", "", err
-		}
-		selectedCipher = resolvedCipher
-	}
-	return selectedCipher, selectedAuth, nil
+	return "", "", ErrNoPushReply
 }
 
 func (c *tlsClient) controlMessageLoop() {
@@ -183,19 +174,23 @@ func (c *tlsClient) sendExplicitExitNotifyIfRequested() {
 	if c.parent == nil {
 		return
 	}
-	notifyCount := int(c.parent.options.Transport.ExplicitExitNotify)
+	if !strings.HasPrefix(c.remote.remote.Protocol, "udp") {
+		return
+	}
+	tunnelConfiguration := c.parent.TunnelConfiguration()
+	notifyCount := int(tunnelConfiguration.ExplicitExitNotify)
 	if notifyCount <= 0 {
 		return
 	}
 	if c.controlChannel == nil {
 		return
 	}
-	deadlineErr := c.controlChannel.SetWriteDeadline(time.Now().Add(time.Second))
-	if deadlineErr != nil {
-		return
-	}
-	if shouldSendCCExitOverControlChannel(c.parent.TunnelConfiguration()) {
+	if shouldSendCCExitOverControlChannel(tunnelConfiguration) {
 		if c.tlsConnection == nil {
+			return
+		}
+		deadlineErr := c.controlChannel.SetWriteDeadline(time.Now().Add(time.Second))
+		if deadlineErr != nil {
 			return
 		}
 		_, _ = c.tlsConnection.Write(tlsControlChannelExitPayload)
@@ -205,7 +200,14 @@ func (c *tlsClient) sendExplicitExitNotifyIfRequested() {
 	if sendCodec == nil {
 		return
 	}
-	for retry := 0; retry < notifyCount && retry < 10; retry++ {
+	for retry := range notifyCount {
+		if retry > 0 {
+			time.Sleep(time.Second)
+		}
+		deadlineErr := c.controlChannel.SetWriteDeadline(time.Now().Add(time.Second))
+		if deadlineErr != nil {
+			return
+		}
 		writeErr := c.tryWriteDataPacket(openVPNDataChannelExitNotifyPayload)
 		if writeErr != nil {
 			return

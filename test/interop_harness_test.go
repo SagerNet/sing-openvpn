@@ -88,21 +88,22 @@ type interopWorkspace struct {
 }
 
 type staticPeerTemplateData struct {
-	Protocol       string
-	LocalHost      string
-	LocalPort      int
-	RemoteHost     string
-	RemotePort     int
-	UseFloat       bool
-	UseNobind      bool
-	TunnelLocal    string
-	TunnelRemote   string
-	SecretPath     string
-	KeyDirection   int
-	Cipher         string
-	Auth           string
-	LogPath        string
-	ExplicitNotify bool
+	Protocol        string
+	LocalHost       string
+	LocalPort       int
+	RemoteHost      string
+	RemotePort      int
+	UseFloat        bool
+	UseNobind       bool
+	TunnelLocal     string
+	TunnelRemote    string
+	SecretPath      string
+	KeyDirection    int
+	Cipher          string
+	Auth            string
+	LogPath         string
+	ExplicitNotify  bool
+	PingExitSeconds int64
 }
 
 type tlsServerTemplateData struct {
@@ -1178,6 +1179,12 @@ func pushLinesForScenario(configuration openvpn.TunnelConfiguration) []string {
 	}
 	for _, dhcpOption := range configuration.DHCPOptions {
 		lines = append(lines, "dhcp-option "+dhcpOption)
+	}
+	if configuration.BlockIPv6 {
+		lines = append(lines, "block-ipv6")
+	}
+	if configuration.BlockOutsideDNS {
+		lines = append(lines, "block-outside-dns")
 	}
 	if configuration.RedirectGateway {
 		lines = append(lines, "redirect-gateway")

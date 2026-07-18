@@ -155,14 +155,14 @@ func TestClientServerLoopbackIntegration(t *testing.T) {
 				if len(configuration.IPv4Routes) != 0 {
 					configurationTest.Fatalf("route should be empty with route_nopull: %+v", configuration.IPv4Routes)
 				}
-				if configuration.RouteGateway.IsValid() {
-					configurationTest.Fatalf("route_gateway should be empty with route_nopull: %s", configuration.RouteGateway)
+				if configuration.RouteGateway != netip.MustParseAddr("10.8.0.1") {
+					configurationTest.Fatalf("route_gateway should remain available with route_nopull: %s", configuration.RouteGateway)
 				}
 				if configuration.RedirectGateway {
 					configurationTest.Fatal("redirect_gateway should be false with route_nopull")
 				}
-				if len(configuration.DNS) != 1 || configuration.DNS[0] != netip.MustParseAddr("1.1.1.1") {
-					configurationTest.Fatalf("unexpected DNS: %+v", configuration.DNS)
+				if len(configuration.DNS) != 0 {
+					configurationTest.Fatalf("DNS should be empty with route_nopull: %+v", configuration.DNS)
 				}
 			},
 		},

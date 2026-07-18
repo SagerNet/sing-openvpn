@@ -24,6 +24,7 @@ type udpPreDecryptResult struct {
 	challenge       []byte
 	serverSessionID proto.SessionID
 	clientSessionID proto.SessionID
+	directReset     bool
 }
 
 // Upstream tls_pre_decrypt_lite admits only key-state zero packets which
@@ -65,10 +66,19 @@ func (s *tlsServer) preDecryptUDPPacket(rawPacket []byte, peerAddress net.Addr, 
 			return udpPreDecryptResult{verdict: udpPreDecryptDrop}, err
 		}
 		if packet.Opcode == proto.OpcodeControlHardResetClientV3 && !earlyNegotiation {
-			// Equivalent to upstream --tls-crypt-v2-force-cookie: without WKC
-			// resend support, preserving the first packet would reintroduce the
-			// unauthenticated per-source state this exchange exists to remove.
-			return udpPreDecryptResult{verdict: udpPreDecryptDrop}, E.New("tls-crypt-v2 client does not support stateless cookie negotiation")
+			if s.parent.options.TLS.CryptV2ForceCookie {
+				return udpPreDecryptResult{verdict: udpPreDecryptDrop}, E.New("tls-crypt-v2 client does not support stateless cookie negotiation")
+			}
+			// Upstream defaults to allow-noncookie for compatibility with clients
+			// which cannot resend the wrapped client key.  The decoded first reset
+			// and its per-client tls-crypt key become the new session's initial
+			// state instead of issuing a stateless cookie challenge.
+			return udpPreDecryptResult{
+				verdict:     udpPreDecryptAccept,
+				packet:      packet,
+				protection:  protection,
+				directReset: true,
+			}, nil
 		}
 		serverSessionID := s.sessionIDHMACSigner.deriveSessionIDAt(packet.LocalSessionID, peerAddress, now.Unix(), 0)
 		challengePacket := &proto.Packet{

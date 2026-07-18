@@ -48,8 +48,13 @@ type interopScenario struct {
 	TLSCryptV2ForceCookie   bool
 	StaticKeyDirectionless  bool
 	RouteNoPull             bool
+	PullFilters             []openvpn.PullFilter
+	AdditionalPushLines     []string
 	RenegotiationInterval   time.Duration
 	RenegotiationPackets    uint64
+	ClientPingInterval      time.Duration
+	ServerPingExit          time.Duration
+	InitialIdle             time.Duration
 	Compression             string
 	CompressionLZO          string
 	AllowCompression        string
@@ -58,6 +63,7 @@ type interopScenario struct {
 	ExpectedMSS             uint16
 	PushConfiguration       openvpn.TunnelConfiguration
 	ExpectedConfiguration   openvpn.TunnelConfiguration
+	CheckPingTimeoutAction  bool
 	ExpectEcho              bool
 	EchoPayloadSize         int
 	ExpectGenerationChange  bool
@@ -108,6 +114,26 @@ var openVPNInteropScenarios = []interopScenario{
 		},
 	},
 	{
+		Name:               "static_key_udp4_client_keepalive_to_real_server",
+		Stage:              interopStageP1,
+		Direction:          interopDirectionClientToRealServer,
+		Current:            interopCurrentPass,
+		Protocol:           "udp4",
+		Mode:               "static_key",
+		Cipher:             "AES-256-CBC",
+		Auth:               "SHA256",
+		ClientPingInterval: time.Second,
+		ServerPingExit:     3 * time.Second,
+		InitialIdle:        4 * time.Second,
+		ExpectEcho:         true,
+		LegacyServerMatrix: true,
+		Covers: []string{
+			"static_key",
+			"static_key_client_ping",
+			"real_server_ping_exit_survival",
+		},
+	},
+	{
 		Name:               "tls_udp4_client_to_real_server_basic",
 		Stage:              interopStageP0,
 		Direction:          interopDirectionClientToRealServer,
@@ -117,6 +143,34 @@ var openVPNInteropScenarios = []interopScenario{
 		ExpectEcho:         true,
 		LegacyServerMatrix: true,
 		Covers:             []string{"tls", "tls_udp4", "p0_client_to_real_server"},
+	},
+	{
+		Name:                   "tls_udp4_client_ping_exit_last_wins",
+		Stage:                  interopStageP0,
+		Direction:              interopDirectionClientToRealServer,
+		Current:                interopCurrentPass,
+		Protocol:               "udp4",
+		Mode:                   "tls",
+		AdditionalPushLines:    []string{"ping-restart 9", "ping-exit 7"},
+		ExpectedConfiguration:  openvpn.TunnelConfiguration{PingExit: 7 * time.Second},
+		CheckPingTimeoutAction: true,
+		ExpectEcho:             true,
+		LegacyServerMatrix:     true,
+		Covers:                 []string{"push_ping_timeout_wire_order", "ping_exit_last"},
+	},
+	{
+		Name:                   "tls_udp4_client_ping_restart_last_wins",
+		Stage:                  interopStageP0,
+		Direction:              interopDirectionClientToRealServer,
+		Current:                interopCurrentPass,
+		Protocol:               "udp4",
+		Mode:                   "tls",
+		AdditionalPushLines:    []string{"ping-exit 7", "ping-restart 9"},
+		ExpectedConfiguration:  openvpn.TunnelConfiguration{PingRestart: 9 * time.Second},
+		CheckPingTimeoutAction: true,
+		ExpectEcho:             true,
+		LegacyServerMatrix:     true,
+		Covers:                 []string{"push_ping_timeout_wire_order", "ping_restart_last"},
 	},
 	{
 		Name:               "tls_tcp4_client_to_real_server_basic",
@@ -245,18 +299,33 @@ var openVPNInteropScenarios = []interopScenario{
 			RouteGateway:    netip.MustParseAddr("10.8.0.1"),
 			IPv4Routes:      []openvpn.TunnelRoute{{Prefix: netip.MustParsePrefix("10.9.0.0/24")}},
 			DHCPOptions:     []string{"DNS 9.9.9.9"},
+			BlockIPv6:       true,
+			BlockOutsideDNS: true,
 			RedirectGateway: true,
 		},
 		ExpectedConfiguration: openvpn.TunnelConfiguration{
-			Topology:    "subnet",
-			TunMTU:      1392,
-			LocalIPv4:   []netip.Prefix{netip.MustParsePrefix("10.8.0.2/24")},
-			IPv4Routes:  []openvpn.TunnelRoute{},
-			DNS:         []netip.Addr{netip.MustParseAddr("9.9.9.9")},
-			DHCPOptions: []string{"DNS 9.9.9.9"},
+			Topology:     "subnet",
+			TunMTU:       1392,
+			LocalIPv4:    []netip.Prefix{netip.MustParsePrefix("10.8.0.2/24")},
+			RouteGateway: netip.MustParseAddr("10.8.0.1"),
+			IPv4Routes:   []openvpn.TunnelRoute{},
+			DNS:          []netip.Addr{},
+			DHCPOptions:  []string{},
 		},
 		ExpectEcho: true,
 		Covers:     []string{"route_nopull"},
+	},
+	{
+		Name:                    "tls_udp4_client_to_real_server_pull_filter_unknown_reject",
+		Stage:                   interopStageP0,
+		Direction:               interopDirectionClientToRealServer,
+		Current:                 interopCurrentPass,
+		Protocol:                "udp4",
+		Mode:                    "tls",
+		PullFilters:             []openvpn.PullFilter{{Action: "reject", Text: "x-test "}},
+		AdditionalPushLines:     []string{"x-test value"},
+		ExpectStartErrorContain: "pull-filter",
+		Covers:                  []string{"pull_filter", "pull_filter_unknown_reject"},
 	},
 	{
 		Name:                   "tls_udp4_client_to_real_server_renegotiation",
@@ -545,16 +614,53 @@ var openVPNInteropScenarios = []interopScenario{
 		Covers:                 []string{"renegotiation", "p0_real_client_to_repo_server"},
 	},
 	{
-		Name:          "tls_udp4_real_client_to_repo_server_tls_crypt_v2",
-		Stage:         interopStageP1,
-		Direction:     interopDirectionRealClientToServer,
-		Current:       interopCurrentPass,
-		SkipReason:    "",
-		Protocol:      "udp4",
-		Mode:          "tls",
-		UseTLSCryptV2: true,
-		ExpectEcho:    true,
-		Covers:        []string{"tls_crypt_v2", "p1_real_client_to_repo_server"},
+		Name:               "tls_udp4_real_client_to_repo_server_tls_crypt_v2",
+		Stage:              interopStageP1,
+		Direction:          interopDirectionRealClientToServer,
+		Current:            interopCurrentPass,
+		SkipReason:         "",
+		Protocol:           "udp4",
+		Mode:               "tls",
+		UseTLSCryptV2:      true,
+		ExpectEcho:         true,
+		LegacyServerMatrix: true,
+		MinOpenVPN:         "2.5",
+		Covers:             []string{"tls_crypt_v2", "p1_real_client_to_repo_server"},
+	},
+	{
+		Name:                    "tls_udp4_real_client_to_repo_server_tls_crypt_v2_force_cookie_old_client",
+		Stage:                   interopStageP1,
+		Direction:               interopDirectionRealClientToServer,
+		Current:                 interopCurrentPass,
+		Protocol:                "udp4",
+		Mode:                    "tls",
+		UseTLSCryptV2:           true,
+		TLSCryptV2ForceCookie:   true,
+		ExpectStartErrorContain: "tls",
+		LegacyServerMatrix:      true,
+		MinOpenVPN:              "2.5",
+		MaxOpenVPN:              "2.5",
+		Covers:                  []string{"tls_crypt_v2_force_cookie", "tls_crypt_v2_old_client_rejection", "p1_real_client_to_repo_server"},
+	},
+	{
+		Name:      "tls_udp4_real_client_to_repo_server_large_push_continuation",
+		Stage:     interopStageP1,
+		Direction: interopDirectionRealClientToServer,
+		Current:   interopCurrentPass,
+		Protocol:  "udp4",
+		Mode:      "tls",
+		PushConfiguration: openvpn.TunnelConfiguration{
+			IPv4Routes: interopLargePushRoutes(100),
+		},
+		ExpectEcho: true,
+		ExpectClientLogContains: []string{
+			"route 10.200.0.0 255.255.255.0",
+			"route 10.200.99.0 255.255.255.0",
+		},
+		RealClientChecks: []string{
+			"ip route show 10.200.99.0/24 | grep -F tun0",
+		},
+		Covers: []string{"push_continuation", "large_push_reply", "p1_real_client_to_repo_server"},
 	},
 	{
 		Name:       "tls_udp4_real_client_to_repo_server_ipv6_push",
@@ -691,4 +797,12 @@ var openVPNInteropScenarios = []interopScenario{
 		EchoPayloadSize:  1152,
 		Covers:           []string{"compression"},
 	},
+}
+
+func interopLargePushRoutes(count int) []openvpn.TunnelRoute {
+	routes := make([]openvpn.TunnelRoute, count)
+	for routeIndex := range count {
+		routes[routeIndex] = openvpn.TunnelRoute{Prefix: netip.PrefixFrom(netip.AddrFrom4([4]byte{10, 200, byte(routeIndex), 0}), 24)}
+	}
+	return routes
 }

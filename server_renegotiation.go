@@ -107,7 +107,7 @@ func applyServerRenegotiationJitter(renegotiationDuration time.Duration) time.Du
 func (s *tlsServerSession) runRenegotiation(channel *tlsControlChannel, initiator bool) (dataCodec, error) {
 	_ = initiator
 	tlsConnection := tls.Server(channel, s.server.tlsConfiguration)
-	deadline := time.Now().Add(tlsHandshakeTotalDuration)
+	deadline := time.Now().Add(s.server.parent.options.Timing.HandWindow)
 	deadlineErr := tlsConnection.SetDeadline(deadline)
 	if deadlineErr != nil {
 		return nil, deadlineErr
@@ -115,6 +115,11 @@ func (s *tlsServerSession) runRenegotiation(channel *tlsControlChannel, initiato
 	handshakeErr := tlsConnection.Handshake()
 	if handshakeErr != nil {
 		return nil, handshakeErr
+	}
+	channel.setTLSConnection(tlsConnection)
+	certificateIdentityErr := s.verifyLockedCertificateIdentity(tlsConnection)
+	if certificateIdentityErr != nil {
+		return nil, certificateIdentityErr
 	}
 	clientKeyMethodRecord, err := readTLSControlRecord(tlsConnection, time.Until(deadline))
 	if err != nil {
@@ -130,7 +135,7 @@ func (s *tlsServerSession) runRenegotiation(channel *tlsControlChannel, initiato
 		if writeErr != nil {
 			return nil, writeErr
 		}
-		_ = s.Close()
+		channel.waitForReliableDelivery(serverScheduledExitInterval)
 		return nil, verifyUserPassErr
 	}
 	serverKeySource, err := generateTLSKeyMethodKeySource(false)
@@ -169,6 +174,9 @@ func (s *tlsServerSession) runRenegotiation(channel *tlsControlChannel, initiato
 	_, writeErr := tlsConnection.Write(serverKeyMethodPayload)
 	if writeErr != nil {
 		return newCodec, writeErr
+	}
+	if !channel.waitForReliableDelivery(time.Until(deadline)) {
+		return newCodec, ErrHandshakeTimeout
 	}
 	_ = tlsConnection.SetDeadline(time.Time{})
 	return newCodec, nil

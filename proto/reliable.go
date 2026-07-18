@@ -110,6 +110,12 @@ func (s *OutgoingReliableState) HasPendingAcknowledgments() bool {
 	return len(s.pendingAcknowledgmentID) > 0
 }
 
+func (s *OutgoingReliableState) HasInFlightPackets() bool {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return len(s.inFlightPackets) > 0
+}
+
 func (s *OutgoingReliableState) PacketsReadyToSend(now time.Time) []*Packet {
 	s.access.Lock()
 	defer s.access.Unlock()

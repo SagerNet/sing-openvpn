@@ -5,7 +5,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
 )
@@ -125,9 +124,14 @@ func (c *Client) stopTunnelConfigurationDispatcher() {
 	c.signalTunnelConfigurationEvent()
 }
 
-func (c *Client) applyPushedOptions(options pushedOptions) {
+type pushedOptionsApplyResult struct {
+	pullFilterRejection      string
+	compressionPushRejection string
+}
+
+func (c *Client) applyPushedOptions(options pushedOptions) pushedOptionsApplyResult {
 	c.tunnel.access.Lock()
-	c.tunnel.pullFilterRejection = ""
+	c.tunnel.pullFilterRejection = options.pullFilterRejection
 	c.tunnel.compressionPushRejection = ""
 	isInitialPulledOptions := !c.tunnel.pulledOptionsReceived
 	deferInitialTunnelEvent := isInitialPulledOptions && c.tunnel.deferInitialEvent
@@ -140,134 +144,119 @@ func (c *Client) applyPushedOptions(options pushedOptions) {
 	}
 	c.tunnel.pulledOptionsReceived = true
 	updatedConfiguration := cloneTunnelConfiguration(c.tunnel.configuration)
-	if updatedConfiguration.Topology == "" && options.Topology != "" {
+	if options.PingRestartSet != options.PingExitSet {
+		if options.PingRestartSet {
+			updatedConfiguration.PingExit = 0
+		} else {
+			updatedConfiguration.PingRestart = 0
+		}
+	}
+	if options.Topology != "" {
 		updatedConfiguration.Topology = options.Topology
 	}
 	c.warnPushedOptionParseErrors(options.parseErrors)
 	c.debugPushedExcludedRoutes(options.excludedRoutes)
-	filteredLocalIPv4 := c.filterPushedLocalAddressValues("ifconfig", options.localAddressByFamily(true), updatedConfiguration.Topology)
-	if len(updatedConfiguration.LocalIPv4) == 0 && len(filteredLocalIPv4) > 0 {
-		localIPv4, vpnGateway := pushedLocalAddressPrefixes(filteredLocalIPv4)
+	pushedLocalIPv4 := options.localAddressByFamily(true)
+	if len(pushedLocalIPv4) > 0 {
+		localIPv4, vpnGateway := pushedLocalAddressPrefixes(pushedLocalIPv4)
 		updatedConfiguration.LocalIPv4 = localIPv4
-		if vpnGateway.IsValid() {
-			updatedConfiguration.VPNGateway = vpnGateway
-		}
+		updatedConfiguration.VPNGateway = vpnGateway
 	}
-	filteredLocalIPv6 := c.filterPushedLocalAddressValues("ifconfig-ipv6", options.localAddressByFamily(false), updatedConfiguration.Topology)
-	if len(updatedConfiguration.LocalIPv6) == 0 && len(filteredLocalIPv6) > 0 {
-		localIPv6, vpnGatewayIPv6 := pushedLocalAddressPrefixes(filteredLocalIPv6)
+	pushedLocalIPv6 := options.localAddressByFamily(false)
+	if len(pushedLocalIPv6) > 0 {
+		localIPv6, vpnGatewayIPv6 := pushedLocalAddressPrefixes(pushedLocalIPv6)
 		updatedConfiguration.LocalIPv6 = localIPv6
-		if vpnGatewayIPv6.IsValid() {
-			updatedConfiguration.VPNGatewayIPv6 = vpnGatewayIPv6
-		}
+		updatedConfiguration.VPNGatewayIPv6 = vpnGatewayIPv6
 	}
-	if updatedConfiguration.TunMTU == 0 && options.TunMTU > 0 {
+	if options.TunMTU > 0 {
 		updatedConfiguration.TunMTU = options.TunMTU
 	}
-	updatedConfiguration.DNS = appendUniqueAddresses(updatedConfiguration.DNS, pushedAddresses(c.filterPushedAddressValues("dns", options.DNS)))
-	updatedConfiguration.DHCPOptions = appendUniqueStringValues(updatedConfiguration.DHCPOptions, c.filterPulledOptionValues("dhcp-option", options.DHCPOptions))
-	if options.BlockIPv6 && c.allowPulledOption("block-ipv6", "") {
-		updatedConfiguration.BlockIPv6 = true
+	if !c.options.Pull.RouteNoPull {
+		updatedConfiguration.DNS = appendUniqueAddresses(updatedConfiguration.DNS, pushedAddresses(options.DNS))
+		updatedConfiguration.DHCPOptions = appendUniqueStringValues(updatedConfiguration.DHCPOptions, options.DHCPOptions)
+		if options.BlockIPv6 {
+			updatedConfiguration.BlockIPv6 = true
+		}
+		if options.BlockOutsideDNS {
+			updatedConfiguration.BlockOutsideDNS = true
+		}
+		if options.RouteMetricSet {
+			updatedConfiguration.RouteMetric = options.RouteMetric
+		}
 	}
-	if options.BlockOutsideDNS && c.allowPulledOption("block-outside-dns", "") {
-		updatedConfiguration.BlockOutsideDNS = true
-	}
-	if options.RouteMetric != 0 && updatedConfiguration.RouteMetric == 0 && c.allowPulledOption("route-metric", strconv.Itoa(options.RouteMetric)) {
-		updatedConfiguration.RouteMetric = options.RouteMetric
-	}
-	if options.PingInterval > 0 && options.PingRestart > 0 &&
-		updatedConfiguration.PingInterval == 0 && updatedConfiguration.PingRestart == 0 &&
-		c.allowPulledOption("keepalive", strconv.FormatInt(int64(options.PingInterval/time.Second), 10)+" "+strconv.FormatInt(int64(options.PingRestart/time.Second), 10)) {
+	if options.PingIntervalSet {
 		updatedConfiguration.PingInterval = options.PingInterval
+	}
+	if options.PingRestartSet {
 		updatedConfiguration.PingRestart = options.PingRestart
 	}
-	if options.AuthToken != "" && c.allowPulledOption("auth-token", options.AuthToken) {
+	if options.AuthToken != "" {
 		updatedConfiguration.AuthToken = options.AuthToken
 		c.tunnel.authToken = options.AuthToken
 	}
-	if options.AuthTokenUser != "" && c.allowPulledOption("auth-token-user", options.AuthTokenUser) {
+	if options.AuthTokenUser != "" {
 		updatedConfiguration.AuthTokenUser = options.AuthTokenUser
 		c.tunnel.authTokenUser = options.AuthTokenUser
 	}
-	if options.ExplicitExitNotify > 0 && updatedConfiguration.ExplicitExitNotify == 0 &&
-		c.allowPulledOption("explicit-exit-notify", strconv.FormatUint(uint64(options.ExplicitExitNotify), 10)) {
+	if options.ExplicitExitNotifySet {
 		updatedConfiguration.ExplicitExitNotify = options.ExplicitExitNotify
 	}
-	if options.PeerID != nil && updatedConfiguration.PeerID == nil &&
-		c.allowPulledOption("peer-id", strconv.FormatUint(uint64(*options.PeerID), 10)) {
+	if options.PeerID != nil {
 		peerIDValue := *options.PeerID
 		updatedConfiguration.PeerID = &peerIDValue
 	}
-	if options.SelectedCipher != "" && updatedConfiguration.SelectedCipher == "" &&
-		c.allowPulledOption("cipher", options.SelectedCipher) {
+	if options.SelectedCipher != "" {
 		updatedConfiguration.SelectedCipher = options.SelectedCipher
 	}
-	if options.SelectedAuth != "" && updatedConfiguration.SelectedAuth == "" &&
-		c.allowPulledOption("auth", options.SelectedAuth) {
+	if options.SelectedAuth != "" {
 		updatedConfiguration.SelectedAuth = options.SelectedAuth
 	}
-	if len(options.ProtocolFlags) > 0 && len(updatedConfiguration.ProtocolFlags) == 0 &&
-		c.allowPulledOption("protocol-flags", strings.Join(options.ProtocolFlags, " ")) {
+	if len(options.ProtocolFlags) > 0 {
 		updatedConfiguration.ProtocolFlags = slices.Clone(options.ProtocolFlags)
 	}
-	if options.KeyDerivation != "" && updatedConfiguration.KeyDerivation == "" &&
-		c.allowPulledOption("key-derivation", options.KeyDerivation) {
+	if options.KeyDerivation != "" {
 		updatedConfiguration.KeyDerivation = options.KeyDerivation
 	}
-	if options.InactiveTimeout > 0 && updatedConfiguration.InactiveTimeout == 0 &&
-		c.allowPulledOption("inactive", formatInactivePullFilterValue(options.InactiveTimeout, options.InactiveMinimumBytes)) {
+	if options.InactiveTimeoutSet {
 		updatedConfiguration.InactiveTimeout = options.InactiveTimeout
 		updatedConfiguration.InactiveMinimumBytes = options.InactiveMinimumBytes
 	}
-	if options.SessionTimeout > 0 && updatedConfiguration.SessionTimeout == 0 &&
-		c.allowPulledOption("session-timeout", strconv.FormatInt(int64(options.SessionTimeout/time.Second), 10)) {
+	if options.SessionTimeoutSet {
 		updatedConfiguration.SessionTimeout = options.SessionTimeout
 	}
-	if options.PingExit > 0 && updatedConfiguration.PingExit == 0 &&
-		c.allowPulledOption("ping-exit", strconv.FormatInt(int64(options.PingExit/time.Second), 10)) {
+	if options.PingExitSet {
 		updatedConfiguration.PingExit = options.PingExit
 	}
-	if options.PingTimerRemote && !updatedConfiguration.PingTimerRemote &&
-		c.allowPulledOption("ping-timer-rem", "") {
+	if options.PingTimerRemote {
 		updatedConfiguration.PingTimerRemote = true
 	}
+	if options.RouteGateway.IsValid() || options.RouteGatewayVPN {
+		effectiveRouteGateway := options.routeGateway(updatedConfiguration.VPNGateway, updatedConfiguration.Topology)
+		if effectiveRouteGateway.IsValid() {
+			updatedConfiguration.RouteGateway = effectiveRouteGateway
+		} else {
+			c.warnPushedOptionParseError("route-gateway", options.routeGatewayFilterValue(), errInvalidPushedRouteGateway)
+		}
+	}
 	if !c.options.Pull.RouteNoPull {
-		effectiveRouteGateway := updatedConfiguration.RouteGateway
-		if !effectiveRouteGateway.IsValid() &&
-			(options.RouteGateway.IsValid() || options.RouteGatewayVPN) &&
-			c.allowPulledOption("route-gateway", options.routeGatewayFilterValue()) {
-			effectiveRouteGateway = options.routeGateway(updatedConfiguration.VPNGateway, updatedConfiguration.Topology)
-			if effectiveRouteGateway.IsValid() {
-				updatedConfiguration.RouteGateway = effectiveRouteGateway
-			} else {
-				c.warnPushedOptionParseError("route-gateway", options.routeGatewayFilterValue(), errInvalidPushedRouteGateway)
-			}
-		}
-		filteredRoutes := c.filterPushedRouteValues("route", options.routesByFamily(true))
-		filteredRouteIPv6 := c.filterPushedRouteValues("route-ipv6", options.routesByFamily(false))
-		updatedConfiguration.IPv4Routes = appendUniqueTunnelRoutes(updatedConfiguration.IPv4Routes, pushedTunnelRoutes(filteredRoutes, updatedConfiguration.RouteMetric))
-		updatedConfiguration.IPv6Routes = appendUniqueTunnelRoutes(updatedConfiguration.IPv6Routes, pushedTunnelRoutes(filteredRouteIPv6, updatedConfiguration.RouteMetric))
-		// OpenVPN 2.6 init_route and init_route_ipv6 resolve omitted gateways only
-		// after route-gateway and pulled ifconfig endpoints are available.
-		ipv4RouteGateway := updatedConfiguration.RouteGateway
-		if !ipv4RouteGateway.Is4() {
-			ipv4RouteGateway = updatedConfiguration.VPNGateway
-		}
-		fillTunnelRouteGateways(updatedConfiguration.IPv4Routes, ipv4RouteGateway)
-		fillTunnelRouteGateways(updatedConfiguration.IPv6Routes, updatedConfiguration.VPNGatewayIPv6)
-		if !updatedConfiguration.RedirectGateway && options.RedirectGateway &&
-			c.allowPulledOption("redirect-gateway", strings.Join(options.RedirectGatewayFlags, " ")) {
+		updatedConfiguration.IPv4Routes = appendUniqueTunnelRoutes(updatedConfiguration.IPv4Routes, pushedTunnelRoutes(options.routesByFamily(true), updatedConfiguration.RouteMetric))
+		updatedConfiguration.IPv6Routes = appendUniqueTunnelRoutes(updatedConfiguration.IPv6Routes, pushedTunnelRoutes(options.routesByFamily(false), updatedConfiguration.RouteMetric))
+		if options.RedirectGateway {
 			updatedConfiguration.RedirectGateway = options.RedirectGateway
 			updatedConfiguration.RedirectGatewayFlags = slices.Clone(options.RedirectGatewayFlags)
 		}
-		if !updatedConfiguration.RedirectPrivate && options.RedirectPrivate &&
-			c.allowPulledOption("redirect-private", "") {
+		if options.RedirectPrivate {
 			updatedConfiguration.RedirectPrivate = true
 		}
-	} else {
-		fillTunnelRouteGateways(updatedConfiguration.IPv4Routes, updatedConfiguration.VPNGateway)
-		fillTunnelRouteGateways(updatedConfiguration.IPv6Routes, updatedConfiguration.VPNGatewayIPv6)
 	}
+	// OpenVPN 2.6 init_route and init_route_ipv6 resolve omitted gateways only
+	// after route-gateway and pulled ifconfig endpoints are available.
+	ipv4RouteGateway := updatedConfiguration.RouteGateway
+	if !ipv4RouteGateway.Is4() {
+		ipv4RouteGateway = updatedConfiguration.VPNGateway
+	}
+	fillTunnelRouteGateways(updatedConfiguration.IPv4Routes, ipv4RouteGateway)
+	fillTunnelRouteGateways(updatedConfiguration.IPv6Routes, updatedConfiguration.VPNGatewayIPv6)
 	c.tunnel.configuration = updatedConfiguration
 	if isInitialPulledOptions {
 		c.maybeReconfigureDataFramingFromPushedOptions(options)
@@ -280,10 +269,15 @@ func (c *Client) applyPushedOptions(options pushedOptions) {
 			Configuration: configurationSnapshot,
 		})
 	}
+	applyResult := pushedOptionsApplyResult{
+		pullFilterRejection:      c.tunnel.pullFilterRejection,
+		compressionPushRejection: c.tunnel.compressionPushRejection,
+	}
 	c.tunnel.access.Unlock()
 	if eventQueued {
 		c.signalTunnelConfigurationEvent()
 	}
+	return applyResult
 }
 
 func (c *Client) setInitialTunnelEventDeferred(deferred bool) {
@@ -328,11 +322,11 @@ func (c *Client) maybeReconfigureDataFramingFromPushedOptions(options pushedOpti
 		return
 	}
 	effectiveCompression := c.options.DataChannel.Compression
-	if pushedCompression != "" && c.allowPulledOption("compress", pushedCompression) {
+	if pushedCompression != "" {
 		effectiveCompression = pushedCompression
 	}
 	effectiveCompressionLZO := c.options.DataChannel.CompressionLZO
-	if pushedCompressionLZO != "" && c.allowPulledOption("comp-lzo", pushedCompressionLZO) {
+	if pushedCompressionLZO != "" {
 		effectiveCompressionLZO = pushedCompressionLZO
 	}
 	if effectiveCompression == c.options.DataChannel.Compression &&
@@ -357,12 +351,19 @@ func (c *Client) warnPushedOptionParseError(optionName string, optionValue strin
 
 func (c *Client) warnPushedOptionParseErrors(parseErrors []pushedOptionParseError) {
 	for _, parseErr := range parseErrors {
-		if c.options.Pull.RouteNoPull && (parseErr.Name == "route" || parseErr.Name == "route-ipv6" || parseErr.Name == "route-gateway") {
+		if c.options.Pull.RouteNoPull && routeNoPullBlocksOption(parseErr.Name) {
 			continue
 		}
-		if c.allowPulledOption(parseErr.Name, parseErr.Value) {
-			c.warnPushedOptionParseError(parseErr.Name, parseErr.Value, parseErr.Err)
-		}
+		c.warnPushedOptionParseError(parseErr.Name, parseErr.Value, parseErr.Err)
+	}
+}
+
+func routeNoPullBlocksOption(optionName string) bool {
+	switch optionName {
+	case "route", "route-ipv6", "route-metric", "redirect-gateway", "redirect-private", "dns", "dhcp-option", "block-ipv6", "block-outside-dns":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -373,65 +374,6 @@ func (c *Client) debugPushedExcludedRoutes(excludedRoutes []pushedExcludedRoute)
 	for _, excludedRoute := range excludedRoutes {
 		c.options.Logger.DebugContext(c.options.Context, "openvpn: ignored pushed ", excludedRoute.Name, " ", strconv.Quote(excludedRoute.Value), ": route uses net_gateway")
 	}
-}
-
-func (c *Client) filterPushedLocalAddressValues(optionName string, values []pushedLocalAddress, topology string) []pushedLocalAddress {
-	if len(values) == 0 {
-		return nil
-	}
-	filteredValues := make([]pushedLocalAddress, 0, len(values))
-	for _, value := range values {
-		filterValue := value.Raw
-		if filterValue == "" {
-			if value.Prefix.Addr().Is4() {
-				filterValue = formatPushedIfconfig(value, topology)
-			} else {
-				filterValue = formatPushedIfconfigIPv6(value)
-			}
-		}
-		if c.allowPulledOption(optionName, filterValue) {
-			filteredValues = append(filteredValues, value)
-		}
-	}
-	return filteredValues
-}
-
-func (c *Client) filterPushedAddressValues(optionName string, values []pushedAddress) []pushedAddress {
-	if len(values) == 0 {
-		return nil
-	}
-	filteredValues := make([]pushedAddress, 0, len(values))
-	for _, value := range values {
-		filterOptionName := optionName
-		if value.OptionName != "" {
-			filterOptionName = value.OptionName
-		}
-		filterValue := value.Raw
-		if filterValue == "" && value.Address.IsValid() {
-			filterValue = value.Address.String()
-		}
-		if c.allowPulledOption(filterOptionName, filterValue) {
-			filteredValues = append(filteredValues, value)
-		}
-	}
-	return filteredValues
-}
-
-func (c *Client) filterPushedRouteValues(optionName string, values []pushedRoute) []pushedRoute {
-	if len(values) == 0 {
-		return nil
-	}
-	filteredValues := make([]pushedRoute, 0, len(values))
-	for _, value := range values {
-		filterValue := value.Raw
-		if filterValue == "" {
-			filterValue = formatPushedRoute(value)
-		}
-		if c.allowPulledOption(optionName, filterValue) {
-			filteredValues = append(filteredValues, value)
-		}
-	}
-	return filteredValues
 }
 
 func appendUniqueStringValues(destination []string, values []string) []string {
@@ -452,49 +394,6 @@ func appendUniqueStringValues(destination []string, values []string) []string {
 		mergedValues = append(mergedValues, value)
 	}
 	return mergedValues
-}
-
-func (c *Client) filterPulledOptionValues(optionName string, values []string) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	filteredValues := make([]string, 0, len(values))
-	for _, value := range values {
-		if c.allowPulledOption(optionName, value) {
-			filteredValues = append(filteredValues, value)
-		}
-	}
-	return filteredValues
-}
-
-func (c *Client) allowPulledOption(optionName string, optionValue string) bool {
-	if len(c.options.Pull.Filters) == 0 {
-		return true
-	}
-	optionLine := optionName
-	if optionValue != "" {
-		optionLine += " " + optionValue
-	}
-	for _, filter := range c.options.Pull.Filters {
-		if filter.Text == "" {
-			continue
-		}
-		if !strings.HasPrefix(strings.ToLower(optionLine), strings.ToLower(filter.Text)) {
-			continue
-		}
-		switch filter.Action {
-		case "ignore":
-			return false
-		case "reject":
-			if c.tunnel.pullFilterRejection == "" {
-				c.tunnel.pullFilterRejection = optionLine
-			}
-			return false
-		case "accept":
-			return true
-		}
-	}
-	return true
 }
 
 func (c *Client) PullFilterRejection() string {

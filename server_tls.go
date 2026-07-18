@@ -26,6 +26,7 @@ type tlsServer struct {
 	tlsCryptV2Server    []byte
 	sessionAccess       sync.RWMutex
 	sessionByPeer       map[string]*tlsServerSession
+	sessionByIdentity   map[string]*tlsServerSession
 	sessionByPeerID     map[uint32]*tlsServerSession
 	udpSessionByAddress map[string]*tlsServerSession
 	loopContext         context.Context
@@ -65,6 +66,7 @@ func newTLSServer(parent *Server) (*tlsServer, error) {
 		staticProtection:    staticProtection,
 		tlsCryptV2Server:    tlsCryptV2Server,
 		sessionByPeer:       make(map[string]*tlsServerSession),
+		sessionByIdentity:   make(map[string]*tlsServerSession),
 		sessionByPeerID:     make(map[uint32]*tlsServerSession),
 		udpSessionByAddress: make(map[string]*tlsServerSession),
 		resourcePolicy:      newServerResourcePolicy(parent.options),
@@ -434,11 +436,18 @@ func (s *tlsServer) runPacketLoop() {
 					defer resourceReservation.release()
 					defer s.unregisterSession(runningSession)
 					defer runningSession.finish()
-					_ = runningSession.runWithCookieResponse(
-						acceptedPreDecryptResult.packet,
-						acceptedPreDecryptResult.protection,
-						acceptedPreDecryptResult.serverSessionID,
-					)
+					if acceptedPreDecryptResult.directReset {
+						_ = runningSession.runWithClientReset(
+							acceptedPreDecryptResult.packet,
+							acceptedPreDecryptResult.protection,
+						)
+					} else {
+						_ = runningSession.runWithCookieResponse(
+							acceptedPreDecryptResult.packet,
+							acceptedPreDecryptResult.protection,
+							acceptedPreDecryptResult.serverSessionID,
+						)
+					}
 				}(session, reservation, preDecryptResult)
 				continue
 			}
@@ -511,6 +520,52 @@ func (s *tlsServer) registerSession(initialPeerAddress string, session *tlsServe
 	return nil
 }
 
+func (s *tlsServer) registerAuthenticatedIdentity(session *tlsServerSession) error {
+	if session == nil {
+		return ErrPeerNotFound
+	}
+	identity := session.authenticatedIdentityKey()
+	session.authenticatedIdentity = identity
+	if identity == "" || s.parent.options.Authentication.DuplicateCN {
+		return nil
+	}
+	s.lifecycleAccess.Lock()
+	if s.lifecycleState != serverLifecycleRunning {
+		s.lifecycleAccess.Unlock()
+		return ErrServerClosed
+	}
+	s.sessionAccess.Lock()
+	if s.sessionByPeer[session.peerAddress] != session {
+		s.sessionAccess.Unlock()
+		s.lifecycleAccess.Unlock()
+		return ErrPeerNotFound
+	}
+	existing := s.sessionByIdentity[identity]
+	s.sessionByIdentity[identity] = session
+	s.sessionAccess.Unlock()
+	s.lifecycleAccess.Unlock()
+	if existing != nil && existing != session {
+		_ = existing.Close()
+		timer := time.NewTimer(serverScheduledExitInterval)
+		select {
+		case <-existing.finishDone:
+			timer.Stop()
+		case <-session.sessionContext.Done():
+			timer.Stop()
+			return session.sessionContext.Err()
+		case <-timer.C:
+			return E.New("timed out replacing prior OpenVPN session for authenticated identity")
+		}
+	}
+	s.sessionAccess.RLock()
+	current := s.sessionByIdentity[identity]
+	s.sessionAccess.RUnlock()
+	if current != session {
+		return ErrPeerRestart
+	}
+	return nil
+}
+
 func (s *tlsServer) enablePeerID(session *tlsServerSession) error {
 	if session == nil {
 		return ErrPeerNotFound
@@ -566,6 +621,9 @@ func (s *tlsServer) unregisterSession(session *tlsServerSession) {
 	}
 	if session.peerIDAssigned && s.sessionByPeerID[session.serverPeerID] == session {
 		delete(s.sessionByPeerID, session.serverPeerID)
+	}
+	if session.authenticatedIdentity != "" && s.sessionByIdentity[session.authenticatedIdentity] == session {
+		delete(s.sessionByIdentity, session.authenticatedIdentity)
 	}
 	for address, boundSession := range s.udpSessionByAddress {
 		if boundSession == session {
