@@ -195,6 +195,15 @@ func (c *Client) Ready() bool {
 	return c.readySession() != nil
 }
 
+func (c *Client) RestartSession() {
+	c.lifecycle.access.Lock()
+	session := c.lifecycle.currentSession
+	c.lifecycle.access.Unlock()
+	if session != nil {
+		session.Fail(E.New("openvpn: session restart requested"))
+	}
+}
+
 func (c *Client) Close() error {
 	c.lifecycle.closeOnce.Do(func() {
 		var supervisorDone chan struct{}
