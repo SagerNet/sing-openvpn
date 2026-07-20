@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	E "github.com/sagernet/sing/common/exceptions"
+
+	ctx509 "github.com/google/certificate-transparency-go/x509"
 )
 
 func hasTLSCredentialMaterial(values ...any) bool {
@@ -79,14 +81,11 @@ func resolveTLSVersionBounds(versionMinToken string, versionMaxToken string) (ui
 // preferred, insecure, and suiteb.
 func parseTLSCertProfile(profile string) (string, error) {
 	switch profile {
-	case "", "legacy":
-		return "legacy", nil
-	case "preferred":
-		return "preferred", nil
-	case "insecure":
-		return "insecure", nil
-	case "suiteb":
-		return "", E.Extend(ErrOptionNotSupported, "tls-cert-profile suiteb")
+	case "", "legacy", "preferred", "insecure", "suiteb":
+		if profile == "" {
+			return "legacy", nil
+		}
+		return profile, nil
 	default:
 		return "", E.New("unknown tls-cert-profile value: ", profile)
 	}
@@ -137,7 +136,11 @@ func buildTLSClientConfiguration(options ClientOptions) (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	clientCertificates, err := loadOptionalClientCertificate(tlsOptions.Certificate, tlsOptions.Key)
+	certProfile, err := parseTLSCertProfile(tlsOptions.CertificateProfile)
+	if err != nil {
+		return nil, err
+	}
+	clientCertificates, err := loadOptionalClientCertificate(tlsOptions.Certificate, tlsOptions.Key, certProfile)
 	if err != nil {
 		return nil, err
 	}
@@ -158,10 +161,6 @@ func buildTLSClientConfiguration(options ClientOptions) (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	certProfile, err := parseTLSCertProfile(tlsOptions.CertificateProfile)
-	if err != nil {
-		return nil, err
-	}
 	tlsCipherSuites, err := parseTLSCipherSuites(tlsOptions.Cipher)
 	if err != nil {
 		return nil, err
@@ -172,7 +171,7 @@ func buildTLSClientConfiguration(options ClientOptions) (*tls.Config, error) {
 	}
 	verifier := &peerCertificateVerifier{options: peerCertificateVerifierOptions{
 		Roots:                    rootCAs,
-		KeyUsage:                 x509.ExtKeyUsageServerAuth,
+		KeyUsage:                 resolveVerificationExtKeyUsage(requiredExtUsage, x509.ExtKeyUsageServerAuth),
 		VerifyName:               tlsOptions.VerifyX509Name,
 		VerifyNameType:           tlsOptions.VerifyX509Type,
 		PeerFingerprints:         tlsOptions.PeerFingerprint,
@@ -183,9 +182,13 @@ func buildTLSClientConfiguration(options ClientOptions) (*tls.Config, error) {
 		NSCertificateType:        tlsOptions.NSCertificateType,
 		CertificateProfile:       certProfile,
 	}}
+	var standardRootCAs *x509.CertPool
+	if rootCAs != nil {
+		standardRootCAs = rootCAs.standard
+	}
 	return &tls.Config{
 		Certificates:       clientCertificates,
-		RootCAs:            rootCAs,
+		RootCAs:            standardRootCAs,
 		MinVersion:         tlsVersionMin,
 		MaxVersion:         tlsVersionMax,
 		CipherSuites:       tlsCipherSuites,
@@ -203,7 +206,7 @@ func buildTLSClientConfiguration(options ClientOptions) (*tls.Config, error) {
 
 // Upstream tls_ctx_load_cert_file_and_copy (ssl_openssl.c) loads a client
 // certificate only when cert_file is set.
-func loadOptionalClientCertificate(certificateMaterial Material, key Material) ([]tls.Certificate, error) {
+func loadOptionalClientCertificate(certificateMaterial Material, key Material, certificateProfile string) ([]tls.Certificate, error) {
 	if !certificateMaterial.IsSet() && !key.IsSet() {
 		return nil, nil
 	}
@@ -216,6 +219,18 @@ func loadOptionalClientCertificate(certificateMaterial Material, key Material) (
 		return nil, err
 	}
 	parsedCertificate, err := tls.X509KeyPair(certificatePEM, keyPEM)
+	if err != nil {
+		return nil, err
+	}
+	localChain := make([]*x509.Certificate, 0, len(parsedCertificate.Certificate))
+	for _, rawCertificate := range parsedCertificate.Certificate {
+		certificate, parseErr := x509.ParseCertificate(rawCertificate)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		localChain = append(localChain, certificate)
+	}
+	err = enforceCertificateProfile([][]*x509.Certificate{localChain}, certificateProfile)
 	if err != nil {
 		return nil, err
 	}
@@ -232,7 +247,11 @@ func buildTLSServerConfiguration(options ServerOptions) (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	certificates, err := loadOptionalClientCertificate(tlsOptions.Certificate, tlsOptions.Key)
+	certProfile, err := parseTLSCertProfile(tlsOptions.CertificateProfile)
+	if err != nil {
+		return nil, err
+	}
+	certificates, err := loadOptionalClientCertificate(tlsOptions.Certificate, tlsOptions.Key, certProfile)
 	if err != nil {
 		return nil, err
 	}
@@ -242,13 +261,18 @@ func buildTLSServerConfiguration(options ServerOptions) (*tls.Config, error) {
 		return nil, err
 	}
 	verifier := &peerCertificateVerifier{options: peerCertificateVerifierOptions{
-		Roots:    rootCAs,
-		KeyUsage: x509.ExtKeyUsageClientAuth,
+		Roots:              rootCAs,
+		KeyUsage:           x509.ExtKeyUsageClientAuth,
+		CertificateProfile: certProfile,
 	}}
+	var standardRootCAs *x509.CertPool
+	if rootCAs != nil {
+		standardRootCAs = rootCAs.standard
+	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{certificate},
 		ClientAuth:   verifyClientCertMode,
-		ClientCAs:    rootCAs,
+		ClientCAs:    standardRootCAs,
 		MinVersion:   tls.VersionTLS12,
 		VerifyPeerCertificate: func(rawCertificates [][]byte, _ [][]*x509.Certificate) error {
 			if verifyClientCertMode == tls.VerifyClientCertIfGiven && len(rawCertificates) == 0 {
@@ -263,7 +287,12 @@ func buildTLSServerConfiguration(options ServerOptions) (*tls.Config, error) {
 	}, nil
 }
 
-func loadCertPool(certificateAuthority Material) (*x509.CertPool, error) {
+type certificatePool struct {
+	standard *x509.CertPool
+	legacy   *ctx509.CertPool
+}
+
+func loadCertPool(certificateAuthority Material) (*certificatePool, error) {
 	if !certificateAuthority.IsSet() {
 		return nil, nil
 	}
@@ -271,18 +300,22 @@ func loadCertPool(certificateAuthority Material) (*x509.CertPool, error) {
 	if err != nil {
 		return nil, err
 	}
-	certPool := x509.NewCertPool()
-	if !certPool.AppendCertsFromPEM(certificateAuthorityData) {
+	standardPool := x509.NewCertPool()
+	if !standardPool.AppendCertsFromPEM(certificateAuthorityData) {
 		return nil, E.New("invalid certificate authority bundle")
 	}
-	return certPool, nil
+	legacyPool := ctx509.NewCertPool()
+	if !legacyPool.AppendCertsFromPEM(certificateAuthorityData) {
+		return nil, E.New("invalid certificate authority bundle")
+	}
+	return &certificatePool{standard: standardPool, legacy: legacyPool}, nil
 }
 
 // Upstream options_postprocess_filechecks (options.c) rejects TLS without
 // CA material or peer fingerprints.
 var ErrMissingCAOrPeerFingerprint = E.New("tls mode: either certificate-authority or peer-fingerprint must be configured")
 
-func requireCAOrPeerFingerprint(roots *x509.CertPool, peerFingerprints []string) error {
+func requireCAOrPeerFingerprint(roots *certificatePool, peerFingerprints []string) error {
 	if roots != nil {
 		return nil
 	}

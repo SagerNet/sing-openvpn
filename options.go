@@ -182,6 +182,7 @@ type ServerTLSOptions struct {
 	CryptV2                 Material
 	CryptV2ForceCookie      bool
 	VerifyClientCertificate string
+	CertificateProfile      string
 }
 
 type ServerAuthenticationOptions struct {

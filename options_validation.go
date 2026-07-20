@@ -265,6 +265,10 @@ func validateImplementedServerOptions(options ServerOptions) error {
 	if err != nil {
 		return err
 	}
+	_, err = parseTLSCertProfile(tlsOptions.CertificateProfile)
+	if err != nil {
+		return err
+	}
 	err = validateServerTransportOptions(options)
 	if err != nil {
 		return err

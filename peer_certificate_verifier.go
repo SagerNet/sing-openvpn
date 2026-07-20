@@ -12,21 +12,24 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
+
+	ctx509 "github.com/google/certificate-transparency-go/x509"
 )
 
 type peerCertificateVerifierOptions struct {
-	Roots                    *x509.CertPool
+	Roots                    *certificatePool
 	KeyUsage                 x509.ExtKeyUsage
 	VerifyName               string
 	VerifyNameType           string
 	PeerFingerprints         []string
 	CRLPath                  string
-	RequiredKeyUsage         uint
+	RequiredKeyUsage         []uint
 	RequireKeyUsageExtension bool
-	RequiredExtendedUsage    []x509.ExtKeyUsage
+	RequiredExtendedUsage    []asn1.ObjectIdentifier
 	NSCertificateType        string
 	CertificateProfile       string
 }
@@ -62,17 +65,22 @@ func (v *peerCertificateVerifier) Verify(rawCertificates [][]byte) error {
 		// Upstream verify_cert still applies profile and usage checks.
 		verifiedChains = [][]*x509.Certificate{{peerCertificates[0]}}
 	} else {
-		intermediates := x509.NewCertPool()
-		for _, peerCertificate := range peerCertificates[1:] {
-			intermediates.AddCert(peerCertificate)
-		}
-		verifyOptions := x509.VerifyOptions{
-			Roots:         v.options.Roots,
-			Intermediates: intermediates,
-		}
-		verifyOptions.KeyUsages = []x509.ExtKeyUsage{v.options.KeyUsage}
 		var err error
-		verifiedChains, err = peerCertificates[0].Verify(verifyOptions)
+		switch v.options.CertificateProfile {
+		case "insecure", "legacy":
+			verifiedChains, err = verifyLegacyCertificateChain(rawCertificates, v.options.Roots, v.options.KeyUsage)
+		default:
+			intermediates := x509.NewCertPool()
+			for _, peerCertificate := range peerCertificates[1:] {
+				intermediates.AddCert(peerCertificate)
+			}
+			verifyOptions := x509.VerifyOptions{
+				Roots:         v.options.Roots.standard,
+				Intermediates: intermediates,
+				KeyUsages:     []x509.ExtKeyUsage{v.options.KeyUsage},
+			}
+			verifiedChains, err = peerCertificates[0].Verify(verifyOptions)
+		}
 		if err != nil {
 			return err
 		}
@@ -114,20 +122,19 @@ func (v *peerCertificateVerifier) Verify(rawCertificates [][]byte) error {
 	return nil
 }
 
-// Upstream tls_ctx_set_cert_profile maps "preferred" to OpenSSL SECLEVEL 2.
 func enforceCertificateProfile(verifiedChains [][]*x509.Certificate, profile string) error {
-	if profile != "preferred" {
-		return nil
-	}
 	if len(verifiedChains) == 0 {
 		return nil
 	}
+	if profile == "" {
+		profile = "legacy"
+	}
 	for _, chainCertificate := range verifiedChains[0] {
-		err := enforcePreferredPublicKey(chainCertificate)
+		err := enforceCertificateProfilePublicKey(chainCertificate, profile)
 		if err != nil {
 			return err
 		}
-		err = enforcePreferredSignatureAlgorithm(chainCertificate)
+		err = enforceCertificateProfileSignatureAlgorithm(chainCertificate, profile)
 		if err != nil {
 			return err
 		}
@@ -135,36 +142,105 @@ func enforceCertificateProfile(verifiedChains [][]*x509.Certificate, profile str
 	return nil
 }
 
-func enforcePreferredPublicKey(peerCertificate *x509.Certificate) error {
+func enforceCertificateProfilePublicKey(peerCertificate *x509.Certificate, profile string) error {
+	if profile == "insecure" {
+		return nil
+	}
+	if profile == "suiteb" {
+		publicKey, loaded := peerCertificate.PublicKey.(*ecdsa.PublicKey)
+		if !loaded {
+			return E.New("tls-cert-profile suiteb requires ECDSA certificates")
+		}
+		curveBits := publicKey.Curve.Params().BitSize
+		if curveBits != 256 && curveBits != 384 {
+			return E.New("tls-cert-profile suiteb requires ECDSA P-256 or P-384")
+		}
+		return nil
+	}
 	switch publicKey := peerCertificate.PublicKey.(type) {
 	case *rsa.PublicKey:
-		if publicKey.N.BitLen() < 2048 {
-			return E.New("tls-cert-profile preferred rejects RSA key smaller than 2048 bits")
+		minimumBits := 1024
+		if profile == "preferred" {
+			minimumBits = 2048
 		}
-	case *ecdsa.PublicKey:
-		if publicKey.Curve.Params().BitSize < 224 {
-			return E.New("tls-cert-profile preferred rejects ECDSA curve smaller than 224 bits")
+		if publicKey.N.BitLen() < minimumBits {
+			return E.New("tls-cert-profile ", profile, " rejects RSA key smaller than ", minimumBits, " bits")
 		}
 	}
 	return nil
 }
 
-func enforcePreferredSignatureAlgorithm(peerCertificate *x509.Certificate) error {
-	switch peerCertificate.SignatureAlgorithm {
-	case x509.MD2WithRSA,
-		x509.MD5WithRSA,
-		x509.SHA1WithRSA,
-		x509.DSAWithSHA1,
-		x509.ECDSAWithSHA1:
-		return E.New("tls-cert-profile preferred rejects legacy signature algorithm")
+func enforceCertificateProfileSignatureAlgorithm(peerCertificate *x509.Certificate, profile string) error {
+	signatureAlgorithm := peerCertificate.SignatureAlgorithm
+	if profile == "suiteb" {
+		if signatureAlgorithm != x509.ECDSAWithSHA256 && signatureAlgorithm != x509.ECDSAWithSHA384 {
+			return E.New("tls-cert-profile suiteb requires ECDSA with SHA-256 or SHA-384")
+		}
+		return nil
+	}
+	switch signatureAlgorithm {
+	case x509.MD2WithRSA, x509.MD5WithRSA:
+		return E.New("tls-cert-profile ", profile, " rejects insecure signature algorithm")
+	case x509.SHA1WithRSA, x509.DSAWithSHA1, x509.ECDSAWithSHA1:
+		if profile == "preferred" {
+			return E.New("tls-cert-profile preferred rejects SHA-1 signature algorithm")
+		}
 	}
 	return nil
+}
+
+func verifyLegacyCertificateChain(rawCertificates [][]byte, roots *certificatePool, keyUsage x509.ExtKeyUsage) ([][]*x509.Certificate, error) {
+	peerCertificate, err := ctx509.ParseCertificate(rawCertificates[0])
+	if err != nil {
+		return nil, err
+	}
+	intermediates := ctx509.NewCertPool()
+	for _, rawCertificate := range rawCertificates[1:] {
+		intermediate, parseErr := ctx509.ParseCertificate(rawCertificate)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		intermediates.AddCert(intermediate)
+	}
+	verifyOptions := ctx509.VerifyOptions{
+		Roots:         roots.legacy,
+		Intermediates: intermediates,
+		KeyUsages:     []ctx509.ExtKeyUsage{legacyExtKeyUsage(keyUsage)},
+	}
+	legacyChains, err := peerCertificate.Verify(verifyOptions)
+	if err != nil {
+		return nil, err
+	}
+	verifiedChains := make([][]*x509.Certificate, 0, len(legacyChains))
+	for _, legacyChain := range legacyChains {
+		verifiedChain := make([]*x509.Certificate, 0, len(legacyChain))
+		for _, legacyCertificate := range legacyChain {
+			certificate, parseErr := x509.ParseCertificate(legacyCertificate.Raw)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			verifiedChain = append(verifiedChain, certificate)
+		}
+		verifiedChains = append(verifiedChains, verifiedChain)
+	}
+	return verifiedChains, nil
+}
+
+func legacyExtKeyUsage(keyUsage x509.ExtKeyUsage) ctx509.ExtKeyUsage {
+	switch keyUsage {
+	case x509.ExtKeyUsageServerAuth:
+		return ctx509.ExtKeyUsageServerAuth
+	case x509.ExtKeyUsageClientAuth:
+		return ctx509.ExtKeyUsageClientAuth
+	default:
+		return ctx509.ExtKeyUsageAny
+	}
 }
 
 // Upstream x509_verify_cert_ku compares --remote-cert-ku against the
 // OpenSSL MSB-first key usage layout.
-func verifyRequiredKeyUsage(peerCertificate *x509.Certificate, requiredKeyUsage uint) error {
-	if requiredKeyUsage == 0 {
+func verifyRequiredKeyUsage(peerCertificate *x509.Certificate, requiredKeyUsage []uint) error {
+	if len(requiredKeyUsage) == 0 || requiredKeyUsage[0] == 0 {
 		return nil
 	}
 	openSSLKeyUsage, present, err := reconstructOpenSSLKeyUsage(peerCertificate)
@@ -174,10 +250,12 @@ func verifyRequiredKeyUsage(peerCertificate *x509.Certificate, requiredKeyUsage 
 	if !present {
 		return ErrPeerCertificateKeyUsage
 	}
-	if openSSLKeyUsage&requiredKeyUsage != requiredKeyUsage {
-		return ErrPeerCertificateKeyUsage
+	for _, candidateKeyUsage := range requiredKeyUsage {
+		if candidateKeyUsage != 0 && openSSLKeyUsage&candidateKeyUsage == candidateKeyUsage {
+			return nil
+		}
 	}
-	return nil
+	return ErrPeerCertificateKeyUsage
 }
 
 // Upstream x509_verify_cert_ku reads id-ce-keyUsage MSB-first and applies
@@ -277,17 +355,35 @@ func checkNetscapeCertTypeBit(peerCertificate *x509.Certificate, expectedBit byt
 	return false, nil
 }
 
-func verifyRequiredExtendedKeyUsage(peerCertificate *x509.Certificate, requiredExtendedUsage []x509.ExtKeyUsage) error {
+func verifyRequiredExtendedKeyUsage(peerCertificate *x509.Certificate, requiredExtendedUsage []asn1.ObjectIdentifier) error {
 	if len(requiredExtendedUsage) == 0 {
 		return nil
 	}
+	certificateExtendedUsage, err := readCertificateExtendedKeyUsage(peerCertificate)
+	if err != nil {
+		return err
+	}
 	for _, expectedExtendedUsage := range requiredExtendedUsage {
-		matched := slices.Contains(peerCertificate.ExtKeyUsage, expectedExtendedUsage)
+		matched := slices.ContainsFunc(certificateExtendedUsage, expectedExtendedUsage.Equal)
 		if !matched {
 			return ErrPeerCertificateExtUsage
 		}
 	}
 	return nil
+}
+
+var extendedKeyUsageExtensionOID = asn1.ObjectIdentifier{2, 5, 29, 37}
+
+func readCertificateExtendedKeyUsage(peerCertificate *x509.Certificate) ([]asn1.ObjectIdentifier, error) {
+	for _, extension := range peerCertificate.Extensions {
+		if !extension.Id.Equal(extendedKeyUsageExtensionOID) {
+			continue
+		}
+		var usages []asn1.ObjectIdentifier
+		_, err := asn1.Unmarshal(extension.Value, &usages)
+		return usages, err
+	}
+	return nil, nil
 }
 
 // Upstream tls_ctx_reload_crl applies OpenSSL CRL_CHECK | CRL_CHECK_ALL.
@@ -354,22 +450,22 @@ func loadRevocationList(crlPath string) (*x509.RevocationList, error) {
 	return x509.ParseRevocationList(crlBytes)
 }
 
-func parseRemoteCertKeyUsages(values []string) (uint, error) {
+func parseRemoteCertKeyUsages(values []string) ([]uint, error) {
 	if len(values) == 0 {
-		return 0, nil
+		return nil, nil
 	}
-	var combined uint
+	parsedValues := make([]uint, 0, len(values))
 	for _, value := range values {
 		if value == "" {
-			return 0, E.New("empty key usage hex")
+			return nil, E.New("empty key usage hex")
 		}
 		parsed, err := parseHexKeyUsage(value)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
-		combined |= parsed
+		parsedValues = append(parsedValues, parsed)
 	}
-	return combined, nil
+	return parsedValues, nil
 }
 
 // Upstream add_option parses --remote-cert-ku with sscanf("%x").
@@ -384,51 +480,109 @@ func parseHexKeyUsage(value string) (uint, error) {
 	return uint(parsed), nil
 }
 
-func parseRemoteCertExtKeyUsage(value string) ([]x509.ExtKeyUsage, error) {
+func parseRemoteCertExtKeyUsage(value string) ([]asn1.ObjectIdentifier, error) {
 	if value == "" {
 		return nil, nil
 	}
-	switch value {
-	case "server":
-		return []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, nil
-	case "client":
-		return []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, nil
-	default:
+	if knownUsage, loaded := openSSLKeyPurposeNames[value]; loaded {
+		return []asn1.ObjectIdentifier{knownUsage}, nil
+	}
+	usage, err := parseObjectIdentifier(value)
+	if err != nil {
 		return nil, E.New("unsupported remote-cert-eku value: ", value)
 	}
+	return []asn1.ObjectIdentifier{usage}, nil
 }
 
 // Upstream add_option expands --remote-cert-tls into KU-required plus EKU.
-func expandRemoteCertTLS(mode string, peerRole string) (bool, []x509.ExtKeyUsage, error) {
+func expandRemoteCertTLS(mode string, peerRole string) (bool, []asn1.ObjectIdentifier, error) {
 	if mode == "" {
 		return false, nil, nil
 	}
 	switch mode {
 	case "server":
 		_ = peerRole
-		return true, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, nil
+		return true, []asn1.ObjectIdentifier{serverAuthOID}, nil
 	case "client":
-		return true, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, nil
+		return true, []asn1.ObjectIdentifier{clientAuthOID}, nil
 	default:
 		return false, nil, E.New("remote-cert-tls must be 'client' or 'server', got: ", mode)
 	}
 }
 
-func mergeExtendedKeyUsage(existing []x509.ExtKeyUsage, additional []x509.ExtKeyUsage) []x509.ExtKeyUsage {
+func mergeExtendedKeyUsage(existing []asn1.ObjectIdentifier, additional []asn1.ObjectIdentifier) []asn1.ObjectIdentifier {
 	if len(additional) == 0 {
 		return existing
 	}
 	if len(existing) == 0 {
 		return additional
 	}
-	merged := make([]x509.ExtKeyUsage, 0, len(existing)+len(additional))
+	merged := make([]asn1.ObjectIdentifier, 0, len(existing)+len(additional))
 	merged = append(merged, existing...)
 	for _, addition := range additional {
-		if !slices.Contains(merged, addition) {
+		if !slices.ContainsFunc(merged, addition.Equal) {
 			merged = append(merged, addition)
 		}
 	}
 	return merged
+}
+
+func resolveVerificationExtKeyUsage(requiredUsage []asn1.ObjectIdentifier, defaultUsage x509.ExtKeyUsage) x509.ExtKeyUsage {
+	if len(requiredUsage) != 1 {
+		return defaultUsage
+	}
+	if requiredUsage[0].Equal(serverAuthOID) {
+		return x509.ExtKeyUsageServerAuth
+	}
+	if requiredUsage[0].Equal(clientAuthOID) {
+		return x509.ExtKeyUsageClientAuth
+	}
+	return x509.ExtKeyUsageAny
+}
+
+var (
+	serverAuthOID          = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 3, 1}
+	clientAuthOID          = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 3, 2}
+	openSSLKeyPurposeNames = map[string]asn1.ObjectIdentifier{
+		"server":                            serverAuthOID,
+		"client":                            clientAuthOID,
+		"TLS Web Server Authentication":     serverAuthOID,
+		"TLS Web Client Authentication":     clientAuthOID,
+		"Code Signing":                      {1, 3, 6, 1, 5, 5, 7, 3, 3},
+		"E-mail Protection":                 {1, 3, 6, 1, 5, 5, 7, 3, 4},
+		"IPSec End System":                  {1, 3, 6, 1, 5, 5, 7, 3, 5},
+		"IPSec Tunnel":                      {1, 3, 6, 1, 5, 5, 7, 3, 6},
+		"IPSec User":                        {1, 3, 6, 1, 5, 5, 7, 3, 7},
+		"Time Stamping":                     {1, 3, 6, 1, 5, 5, 7, 3, 8},
+		"OCSP Signing":                      {1, 3, 6, 1, 5, 5, 7, 3, 9},
+		"Any Extended Key Usage":            {2, 5, 29, 37, 0},
+		"Microsoft Server Gated Crypto":     {1, 3, 6, 1, 4, 1, 311, 10, 3, 3},
+		"Netscape Server Gated Crypto":      {2, 16, 840, 1, 113730, 4, 1},
+		"Microsoft Commercial Code Signing": {1, 3, 6, 1, 4, 1, 311, 2, 1, 22},
+		"Microsoft Individual Code Signing": {1, 3, 6, 1, 4, 1, 311, 2, 1, 21},
+	}
+)
+
+func parseObjectIdentifier(value string) (asn1.ObjectIdentifier, error) {
+	parts := strings.Split(value, ".")
+	if len(parts) < 2 {
+		return nil, E.New("invalid object identifier")
+	}
+	identifier := make(asn1.ObjectIdentifier, 0, len(parts))
+	for _, part := range parts {
+		if part == "" {
+			return nil, E.New("invalid object identifier")
+		}
+		component, err := strconv.Atoi(part)
+		if err != nil || component < 0 {
+			return nil, E.New("invalid object identifier")
+		}
+		identifier = append(identifier, component)
+	}
+	if identifier[0] > 2 || identifier[0] < 2 && identifier[1] > 39 {
+		return nil, E.New("invalid object identifier")
+	}
+	return identifier, nil
 }
 
 // Upstream --peer-fingerprint compares the leaf certificate's SHA256 digest
