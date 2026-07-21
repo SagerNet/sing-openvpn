@@ -99,7 +99,7 @@ func (p *ipPool) configureIPv4(prefix netip.Prefix) error {
 	// OpenVPN's --server helper accepts at most 65536 addresses and requires
 	// enough room for its server endpoints plus a client pool.
 	if prefix.Bits() < 16 || prefix.Bits() > 29 {
-		return E.New("OpenVPN IPv4 address pool must be between /16 and /29: ", prefix)
+		return E.New("IPv4 address pool must be between /16 and /29: ", prefix)
 	}
 	network := prefix.Masked().Addr()
 	broadcast := lastIPv4InPrefix(prefix)
@@ -121,7 +121,7 @@ func (p *ipPool) configureIPv4(prefix netip.Prefix) error {
 		p.ipv4End = addIPv4(broadcast, -poolEndReserve)
 	}
 	if !p.ipv4Start.IsValid() || !p.ipv4End.IsValid() || p.ipv4Start.Compare(p.ipv4End) > 0 {
-		return E.New("OpenVPN IPv4 address pool has no allocatable addresses: ", prefix)
+		return E.New("IPv4 address pool has no allocatable addresses: ", prefix)
 	}
 	return nil
 }

@@ -2,27 +2,23 @@ package openvpn
 
 import E "github.com/sagernet/sing/common/exceptions"
 
-// Upstream options_postprocess_mutate (options.c) stores
-// --allow-compression as compress_options.flags:
-//
-//	"no"   -> COMP_F_ALLOW_STUB_ONLY | COMP_F_ADVERTISE_STUBS_ONLY
-//	"asym" -> COMP_F_ALLOW_ASYM (clear COMP_F_ALLOW_COMPRESS)
-//	"yes"  -> COMP_F_ALLOW_COMPRESS
 type allowCompressionPolicy int
 
 const (
 	allowCompressionStubOnly allowCompressionPolicy = iota
 	allowCompressionAsymmetric
+	// OpenVPN 2.7 maps explicit "yes" to asymmetric mode. Keep outbound
+	// compression here only for explicitly requested legacy compatibility.
 	allowCompressionYes
 )
 
 // Upstream options_postprocess_mutate (options.c) rejects bad
 // --allow-compression tokens.
-var ErrInvalidAllowCompression = E.New("openvpn: invalid allow-compression value")
+var ErrInvalidAllowCompression = E.New("invalid allow-compression value")
 
 // Upstream options_postprocess_mutate (options.c) flags
 // --allow-compression no with non-stub compression.
-var ErrAllowCompressionConflict = E.New("openvpn: allow-compression no conflicts with statically enabled compression")
+var ErrAllowCompressionConflict = E.New("allow-compression no conflicts with statically enabled compression")
 
 func validateCompressionOptions(compression string, compressionLZO string) error {
 	if compression != "" &&
@@ -76,8 +72,6 @@ func compressionFramingIsStub(framingValue string, lzoValue string) bool {
 	return true
 }
 
-// Upstream show_compression_warning (options.c) leaves outgoing compression
-// disabled unless --allow-compression yes is explicitly configured.
 func resolveEffectiveAllowCompressionPolicy(allowCompression string, compression string, compressionLZO string) (allowCompressionPolicy, error) {
 	staticCompressionIsNonStub := !compressionFramingIsStub(compression, compressionLZO)
 	if allowCompression == "" {

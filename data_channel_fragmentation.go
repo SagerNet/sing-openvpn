@@ -124,7 +124,7 @@ func (f *dataChannelFraming) storeIncomingFragment(sequenceID int, fragmentID in
 		maxReassemblyBytes = openVPNFragmentReassemblyMaxBytes
 	}
 	if len(payload) > maxPacketBytes {
-		return nil, false, E.New("OpenVPN fragment exceeds maximum reassembled packet size")
+		return nil, false, E.New("fragment exceeds maximum reassembled packet size")
 	}
 	f.advanceIncomingFragmentWindow(sequenceID)
 
@@ -151,13 +151,13 @@ func (f *dataChannelFraming) storeIncomingFragment(sequenceID int, fragmentID in
 	additionalBytes := len(payload) - len(previousPart)
 	if fragmentBuffer.bytes+additionalBytes > maxPacketBytes {
 		f.deleteIncomingFragmentBuffer(sequenceID)
-		return nil, false, E.New("OpenVPN fragmented packet exceeds maximum IP packet size")
+		return nil, false, E.New("fragmented packet exceeds maximum IP packet size")
 	}
 	for f.incomingBytes+additionalBytes > maxReassemblyBytes {
 		oldestSequence, found := f.oldestIncomingFragmentSequence(sequenceID)
 		if !found {
 			f.deleteIncomingFragmentBuffer(sequenceID)
-			return nil, false, E.New("OpenVPN fragment reassembly memory limit exceeded")
+			return nil, false, E.New("fragment reassembly memory limit exceeded")
 		}
 		f.deleteIncomingFragmentBuffer(oldestSequence)
 	}

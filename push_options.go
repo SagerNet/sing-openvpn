@@ -30,13 +30,17 @@ func buildPushedOptions(options ServerOptions) pushedOptions {
 		LocalAddress:         localAddress,
 		Routes:               pushedRoutesFromPrefixes(options.Push.Routes),
 		DNS:                  pushedAddressesFromAddresses(options.Push.DNS),
+		DNSServers:           cloneTunnelDNSServers(options.Push.DNSServers),
+		DHCPOptions:          slices.Clone(options.Push.DHCPOptions),
+		SearchDomains:        slices.Clone(options.Push.SearchDomains),
+		modernDNS:            len(options.Push.DNSServers) > 0,
 		BlockOutsideDNS:      options.Push.BlockOutsideDNS,
 		RedirectGateway:      options.Push.RedirectGateway,
 		RedirectGatewayFlags: slices.Clone(options.Push.RedirectGatewayFlags),
 		PingInterval:         options.Push.PingInterval,
-		PingIntervalSet:      options.Push.PingIntervalSet || options.Push.PingInterval > 0,
+		PingIntervalEnabled:  options.Push.PingIntervalEnabled || options.Push.PingInterval > 0,
 		PingRestart:          options.Push.PingRestart,
-		PingRestartSet:       options.Push.PingRestartSet || options.Push.PingRestart > 0,
+		PingRestartEnabled:   options.Push.PingRestartEnabled || options.Push.PingRestart > 0,
 	}
 }
 
@@ -85,6 +89,46 @@ func buildPushReplyOptionFields(options pushedOptions) []string {
 			pushOptionFields = append(pushOptionFields, "dhcp-option DNS6 "+escapePushReplyFieldValue(dnsValue.Address.String()))
 		}
 	}
+	if len(options.SearchDomains) > 0 {
+		pushOptionFields = append(pushOptionFields, "dns search-domains "+escapePushReplyFieldValue(strings.Join(options.SearchDomains, " ")))
+	}
+	servers := cloneTunnelDNSServers(options.DNSServers)
+	slices.SortFunc(servers, func(left TunnelDNSServer, right TunnelDNSServer) int {
+		return left.Priority - right.Priority
+	})
+	for _, server := range servers {
+		priority := strconv.Itoa(server.Priority)
+		if len(server.Addresses) > 0 {
+			addresses := make([]string, len(server.Addresses))
+			for i, address := range server.Addresses {
+				if address.Port() == 0 {
+					addresses[i] = address.Addr().String()
+				} else {
+					addresses[i] = address.String()
+				}
+			}
+			pushOptionFields = append(pushOptionFields, "dns server "+priority+" address "+escapePushReplyFieldValue(strings.Join(addresses, " ")))
+		}
+		if len(server.ResolveDomains) > 0 {
+			pushOptionFields = append(pushOptionFields, "dns server "+priority+" resolve-domains "+escapePushReplyFieldValue(strings.Join(server.ResolveDomains, " ")))
+		}
+		if server.DNSSEC != "" {
+			pushOptionFields = append(pushOptionFields, "dns server "+priority+" dnssec "+escapePushReplyFieldValue(server.DNSSEC))
+		}
+		if server.Transport != "" {
+			transport := server.Transport
+			switch transport {
+			case "doh":
+				transport = "DoH"
+			case "dot":
+				transport = "DoT"
+			}
+			pushOptionFields = append(pushOptionFields, "dns server "+priority+" transport "+escapePushReplyFieldValue(transport))
+		}
+		if server.SNI != "" {
+			pushOptionFields = append(pushOptionFields, "dns server "+priority+" sni "+escapePushReplyFieldValue(server.SNI))
+		}
+	}
 	for _, dhcpOption := range options.DHCPOptions {
 		dhcpOption = strings.TrimSpace(dhcpOption)
 		if dhcpOption == "" {
@@ -112,10 +156,10 @@ func buildPushReplyOptionFields(options pushedOptions) []string {
 	if options.RouteMetric != 0 {
 		pushOptionFields = append(pushOptionFields, "route-metric "+strconv.Itoa(options.RouteMetric))
 	}
-	if options.PingIntervalSet {
+	if options.PingIntervalEnabled {
 		pushOptionFields = append(pushOptionFields, "ping "+strconv.FormatInt(int64(options.PingInterval/time.Second), 10))
 	}
-	if options.PingRestartSet {
+	if options.PingRestartEnabled {
 		pushOptionFields = append(pushOptionFields, "ping-restart "+strconv.FormatInt(int64(options.PingRestart/time.Second), 10))
 	}
 	if authToken := strings.TrimSpace(options.AuthToken); authToken != "" {

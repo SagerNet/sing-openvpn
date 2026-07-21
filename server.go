@@ -4,8 +4,6 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
-
-	E "github.com/sagernet/sing/common/exceptions"
 )
 
 type Server struct {
@@ -13,6 +11,7 @@ type Server struct {
 	protocol                   string
 	listenNetwork              string
 	tls                        *tlsServer
+	static                     *staticKeyServer
 	incomingPacketDropLog      droppedPacketLog
 	incomingDataPackets        *dataPacketQueue[ServerDataBuffer]
 	droppedIncomingDataPackets atomic.Uint64
@@ -56,18 +55,26 @@ func NewServer(options ServerOptions) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	if mode != ModeTLS {
-		return nil, E.Extend(ErrOptionNotSupported, "server static_key mode")
-	}
 	err = validateImplementedServerOptions(options)
 	if err != nil {
 		return nil, err
 	}
-	if options.Timing.RenegotiationInterval == 0 && !options.Timing.RenegotiationIntervalSet {
-		options.Timing.RenegotiationInterval = defaultRenegotiationInterval
+	if options.DataChannel.MSSFix == 0 && !options.DataChannel.MSSFixDisabled {
+		if options.DataChannel.MTU == 0 || options.DataChannel.MTU == 1500 {
+			options.DataChannel.MSSFix = defaultMSSFix
+			options.DataChannel.MSSFixMode = MSSFixModeMTU
+		} else {
+			options.DataChannel.MSSFix = options.DataChannel.MTU
+			options.DataChannel.MSSFixMode = MSSFixModeFixed
+		}
 	}
-	if options.Timing.HandWindow == 0 {
-		options.Timing.HandWindow = tlsHandshakeTotalDuration
+	if mode == ModeTLS {
+		if options.Timing.RenegotiationInterval == 0 && !options.Timing.RenegotiationDisabled {
+			options.Timing.RenegotiationInterval = defaultRenegotiationInterval
+		}
+		if options.Timing.HandWindow == 0 {
+			options.Timing.HandWindow = tlsHandshakeTotalDuration
+		}
 	}
 	server := &Server{
 		options:             options,
@@ -79,9 +86,13 @@ func NewServer(options ServerOptions) (*Server, error) {
 	}
 	server.incomingPacketDropLog.logger = options.Logger
 	server.incomingPacketDropLog.ctx = options.Context
-	server.tls, err = newTLSServer(server)
-	if err != nil {
-		return nil, err
+	if mode == ModeTLS {
+		server.tls, err = newTLSServer(server)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		server.static = newStaticKeyServer(server)
 	}
 	return server, nil
 }
@@ -103,7 +114,11 @@ func (s *Server) Start() error {
 		s.lifecycleState = serverLifecycleInitial
 		return err
 	}
-	err = s.tls.Start()
+	if s.static != nil {
+		err = s.static.Start()
+	} else {
+		err = s.tls.Start()
+	}
 	if err != nil {
 		s.lifecycleState = serverLifecycleInitial
 		return err
@@ -132,7 +147,12 @@ func (s *Server) Close() error {
 		s.lifecycleAccess.Unlock()
 	}
 
-	closeErr := s.tls.Close()
+	var closeErr error
+	if s.static != nil {
+		closeErr = s.static.Close()
+	} else {
+		closeErr = s.tls.Close()
+	}
 	s.incomingDataPackets.Drain(func(packet ServerDataBuffer) {
 		if packet.Buffer != nil {
 			packet.Buffer.Release()
@@ -152,6 +172,9 @@ func (s *Server) activeLoopContext() (context.Context, error) {
 	defer s.lifecycleAccess.Unlock()
 	switch s.lifecycleState {
 	case serverLifecycleRunning:
+		if s.static != nil {
+			return s.static.loopContext, nil
+		}
 		return s.tls.loopContext, nil
 	case serverLifecycleClosing, serverLifecycleClosed:
 		return nil, ErrServerClosed

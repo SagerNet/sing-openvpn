@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-openvpn/proto"
+	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
@@ -99,22 +100,38 @@ func newTLSClient(parent *Client, useActiveAuthToken bool, remote clientRemote) 
 		renegotiate: func(_ *tlsPeerSession, channel *tlsControlChannel, initiator bool) (dataCodec, error) {
 			return client.runRenegotiation(channel, initiator)
 		},
-		onRenegotiated: func(_ *tlsPeerSession) {
+		onRenegotiated: func(_ *tlsPeerSession, keyID uint8) {
 			if client.keepalive != nil {
-				client.keepalive.noteRenegotiated()
+				client.keepalive.noteRenegotiated(keyID)
 			}
 		},
 	}
 	client.hooks = tlsPeerHooks{
-		outgoingDataPayloads:     client.parent.outgoingDataPayloadBatches,
-		outgoingDataBuffers:      client.parent.outgoingDataBufferBatches,
-		deliverIncomingPayloads:  client.parent.handleIncomingDataPayloads,
-		deliverIncomingBuffers:   client.parent.handleIncomingDataBuffers,
+		outgoingDataPayloads: func(payloads [][]byte, codec dataCodec, packetHeaderSize int) ([][][]byte, error) {
+			return client.parent.outgoingDataPayloadBatches(payloads, codec, packetHeaderSize, client.mssFixOuterTransportOverhead())
+		},
+		outgoingDataBuffers: func(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int) ([][]*buf.Buffer, error) {
+			return client.parent.outgoingDataBufferBatches(payloads, codec, packetHeaderSize, client.mssFixOuterTransportOverhead())
+		},
+		deliverIncomingPayloads: func(payloads [][]byte, codec dataCodec, packetHeaderSize int) {
+			client.parent.handleIncomingDataPayloads(payloads, codec, packetHeaderSize, client.mssFixOuterTransportOverhead())
+		},
+		deliverIncomingBuffers: func(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int) {
+			client.parent.handleIncomingDataBuffers(payloads, codec, packetHeaderSize, client.mssFixOuterTransportOverhead())
+		},
 		incomingPacketHeadroom:   client.parent.options.DataChannel.PacketHeadroom,
 		sessionTerminated:        client.finish,
 		logDroppedIncomingPacket: client.parent.dataPlane.incomingPacketDropLog.Log,
 	}
 	return client, nil
+}
+
+func (c *tlsClient) mssFixOuterTransportOverhead() int {
+	var remoteAddress net.Addr
+	if c.packetConnection != nil {
+		remoteAddress = c.packetConnection.RemoteAddr()
+	}
+	return openVPNOuterTransportOverhead(c.remote.remote.Protocol, remoteAddress)
 }
 
 func newTLSClientProtection(options ClientOptions) (tlsControlProtection, []byte, error) {
@@ -289,7 +306,9 @@ func (c *tlsClient) Start() error {
 		false,
 		selectedCipher,
 		selectedAuth,
+		c.remote.remote.Protocol,
 		c.parent.options.DataChannel.ReplayWindow,
+		c.parent.options.DataChannel.ReplayWindowTime,
 	)
 	if err != nil {
 		_ = c.Close()
@@ -302,9 +321,11 @@ func (c *tlsClient) Start() error {
 		parent:          c.parent,
 		writeDataPacket: c.WriteDataPacket,
 	}
-	c.keepalive.configureRenegotiation(selectedCipher)
+	c.keepalive.configureRenegotiation(selectedCipher, c.sessionManager.CurrentKeyID())
 	c.setDataObservers(
-		c.keepalive.consumeRenegotiationBudget,
+		c.keepalive.consumeOutboundRenegotiationBudget,
+		c.keepalive.consumeInboundRenegotiationCounter,
+		c.keepalive.consumeInboundRenegotiationUsage,
 		func() { c.keepalive.markActivity(true, false) },
 		c.keepalive.registerInactivityBytes,
 		func() { c.keepalive.markActivity(false, true) },
@@ -622,7 +643,9 @@ func (c *tlsClient) runRenegotiation(channel *tlsControlChannel, initiator bool)
 		false,
 		c.remoteSelectedCipher,
 		c.remoteSelectedAuth,
+		c.remote.remote.Protocol,
 		c.parent.options.DataChannel.ReplayWindow,
+		c.parent.options.DataChannel.ReplayWindowTime,
 	)
 	if err != nil {
 		return nil, err

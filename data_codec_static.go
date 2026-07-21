@@ -19,7 +19,12 @@ import (
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 
+	"github.com/RyuaNerin/go-krypto/aria"
+	"github.com/RyuaNerin/go-krypto/seed"
+	camellia "github.com/dgryski/go-camellia"
+	"github.com/tjfoc/gmsm/sm4"
 	"golang.org/x/crypto/blowfish"  //nolint:staticcheck // OpenVPN BF-CBC compatibility requires Blowfish.
+	"golang.org/x/crypto/cast5"     //nolint:staticcheck // OpenVPN CAST5-CBC compatibility requires CAST5.
 	"golang.org/x/crypto/ripemd160" //nolint:staticcheck // OpenVPN RIPEMD160 authentication compatibility requires RIPEMD-160.
 )
 
@@ -29,6 +34,8 @@ type staticKeyDataCodec struct {
 	receiveCandidates []staticKeyDecodeCandidate
 	hashFactory       func() hash.Hash
 	hmacSize          int
+	sendTimestamp     uint32
+	replayWindow      *replayWindow
 }
 
 func (c *staticKeyDataCodec) EncodedLength(payloadLength int) int {
@@ -58,7 +65,7 @@ func (c *staticKeyDataCodec) Encode(packetID uint32, aadPrefix []byte, payload [
 	}
 	plainPayload := make([]byte, 8+len(payload))
 	binary.BigEndian.PutUint32(plainPayload[:4], packetID)
-	binary.BigEndian.PutUint32(plainPayload[4:8], uint32(time.Now().Unix()))
+	binary.BigEndian.PutUint32(plainPayload[4:8], c.sendTimestamp)
 	copy(plainPayload[8:], payload)
 	protectedPayload := plainPayload
 	if c.sendCipherBlock != nil {
@@ -109,8 +116,11 @@ func (c *staticKeyDataCodec) Decode(aadPrefix []byte, payload []byte) (uint32, [
 	_ = aadPrefix
 	var decodeError error
 	for _, candidate := range c.receiveCandidates {
-		packetID, decodedPayload, err := c.decodeWithCandidate(payload, candidate)
+		packetID, packetTimestamp, decodedPayload, err := c.decodeWithCandidate(payload, candidate)
 		if err == nil {
+			if c.replayWindow != nil && !c.replayWindow.AcceptLongForm(packetID, packetTimestamp) {
+				return 0, nil, E.New("replayed static key data packet")
+			}
 			return packetID, decodedPayload, nil
 		}
 		decodeError = err
@@ -129,11 +139,11 @@ func (c *staticKeyDataCodec) DecodeBuffer(aadPrefix []byte, payload []byte, head
 	return packetID, newDataPacketBuffer(headroom, decodedPayload), nil
 }
 
-func (c *staticKeyDataCodec) decodeWithCandidate(payload []byte, candidate staticKeyDecodeCandidate) (uint32, []byte, error) {
+func (c *staticKeyDataCodec) decodeWithCandidate(payload []byte, candidate staticKeyDecodeCandidate) (uint32, uint32, []byte, error) {
 	protectedPayload := payload
 	if c.hmacSize > 0 {
 		if len(protectedPayload) < c.hmacSize {
-			return 0, nil, E.New("invalid static key payload")
+			return 0, 0, nil, E.New("invalid static key payload")
 		}
 		receivedMAC := protectedPayload[:c.hmacSize]
 		protectedPayload = protectedPayload[c.hmacSize:]
@@ -141,14 +151,14 @@ func (c *staticKeyDataCodec) decodeWithCandidate(payload []byte, candidate stati
 		mac.Write(protectedPayload)
 		expectedMAC := mac.Sum(nil)
 		if !hmac.Equal(receivedMAC, expectedMAC) {
-			return 0, nil, E.New("invalid static key payload hmac")
+			return 0, 0, nil, E.New("invalid static key payload hmac")
 		}
 	}
 	plainPayload := protectedPayload
 	if candidate.cipherBlock != nil {
 		blockSize := candidate.cipherBlock.BlockSize()
 		if len(protectedPayload) < blockSize*2 || len(protectedPayload)%blockSize != 0 {
-			return 0, nil, E.New("invalid static key payload")
+			return 0, 0, nil, E.New("invalid static key payload")
 		}
 		initializationVector := protectedPayload[:blockSize]
 		cipherPayload := protectedPayload[blockSize:]
@@ -156,23 +166,24 @@ func (c *staticKeyDataCodec) decodeWithCandidate(payload []byte, candidate stati
 		cipher.NewCBCDecrypter(candidate.cipherBlock, initializationVector).CryptBlocks(decodedPayload, cipherPayload)
 		unpaddedPayload, err := pkcs7Unpad(decodedPayload, blockSize)
 		if err != nil {
-			return 0, nil, err
+			return 0, 0, nil, err
 		}
 		plainPayload = unpaddedPayload
 	}
 	if len(plainPayload) < 8 {
-		return 0, nil, E.New("invalid static key payload")
+		return 0, 0, nil, E.New("invalid static key payload")
 	}
 	packetID := binary.BigEndian.Uint32(plainPayload[:4])
 	if packetID == 0 {
-		return 0, nil, E.New("invalid static key packet id")
+		return 0, 0, nil, E.New("invalid static key packet id")
 	}
+	packetTimestamp := binary.BigEndian.Uint32(plainPayload[4:8])
 	decodedPayload := make([]byte, len(plainPayload)-8)
 	copy(decodedPayload, plainPayload[8:])
-	return packetID, decodedPayload, nil
+	return packetID, packetTimestamp, decodedPayload, nil
 }
 
-func newStaticKeyDataCodec(staticKey Material, keyDirection int, cipherName string, authName string) (dataCodec, error) {
+func newStaticKeyDataCodec(staticKey Material, keyDirection int, cipherName string, authName string, replayWindowSize uint32, replayWindowTime time.Duration) (dataCodec, error) {
 	staticKeyMaterial, err := loadStaticKeyMaterialFromSource(staticKey)
 	if err != nil {
 		return nil, err
@@ -233,6 +244,8 @@ func newStaticKeyDataCodec(staticKey Material, keyDirection int, cipherName stri
 		receiveCandidates: receiveCandidates,
 		hashFactory:       hashFactory,
 		hmacSize:          hmacSize,
+		sendTimestamp:     uint32(time.Now().Unix()),
+		replayWindow:      newReplayWindow(replayWindowSize, replayWindowTime),
 	}, nil
 }
 
@@ -263,13 +276,25 @@ func staticCipherKeySize(cipherName string) (int, error) {
 	switch cipherName {
 	case "BF-CBC":
 		return 16, nil
+	case "DES-CBC":
+		return 8, nil
+	case "DES-EDE-CBC":
+		return 16, nil
 	case "DES-EDE3-CBC":
 		return 24, nil
+	case "CAST5-CBC":
+		return 16, nil
 	case "AES-128-CBC":
 		return 16, nil
 	case "AES-192-CBC":
 		return 24, nil
 	case "AES-256-CBC":
+		return 32, nil
+	case "ARIA-128-CBC", "CAMELLIA-128-CBC", "SEED-CBC", "SM4-CBC":
+		return 16, nil
+	case "ARIA-192-CBC", "CAMELLIA-192-CBC":
+		return 24, nil
+	case "ARIA-256-CBC", "CAMELLIA-256-CBC":
 		return 32, nil
 	case "NONE":
 		return 0, nil
@@ -290,10 +315,27 @@ func newStaticCipherBlock(cipherName string, keyMaterial []byte, keySize int) (c
 	switch cipherName {
 	case "BF-CBC":
 		return blowfish.NewCipher(cipherKey)
+	case "DES-CBC":
+		return des.NewCipher(cipherKey)
+	case "DES-EDE-CBC":
+		expandedCipherKey := make([]byte, 24)
+		copy(expandedCipherKey, cipherKey)
+		copy(expandedCipherKey[16:], cipherKey[:8])
+		return des.NewTripleDESCipher(expandedCipherKey)
 	case "DES-EDE3-CBC":
 		return des.NewTripleDESCipher(cipherKey)
+	case "CAST5-CBC":
+		return cast5.NewCipher(cipherKey)
 	case "AES-128-CBC", "AES-192-CBC", "AES-256-CBC":
 		return aes.NewCipher(cipherKey)
+	case "ARIA-128-CBC", "ARIA-192-CBC", "ARIA-256-CBC":
+		return aria.NewCipher(cipherKey)
+	case "CAMELLIA-128-CBC", "CAMELLIA-192-CBC", "CAMELLIA-256-CBC":
+		return camellia.New(cipherKey)
+	case "SEED-CBC":
+		return seed.NewCipher(cipherKey)
+	case "SM4-CBC":
+		return sm4.NewCipher(cipherKey)
 	default:
 		return nil, E.New("unsupported static key cipher")
 	}

@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -152,6 +153,28 @@ func TestCertificateProfileIntegration(t *testing.T) {
 			)
 		})
 	}
+	md5Material := createCertificateVerificationMaterial(t, certificateVerificationParameters{
+		authorityKey:           rsaAuthority,
+		authoritySignature:     x509.SHA256WithRSA,
+		serverKey:              generateRSASigner(t, 2048),
+		serverSignature:        x509.MD5WithRSA,
+		serverKeyUsage:         x509.KeyUsageDigitalSignature,
+		serverExtendedKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	})
+	t.Run("md5_allowed_by_insecure", func(t *testing.T) {
+		runCertificateVerificationSession(t, md5Material,
+			openvpn.ClientTLSOptions{CertificateProfile: "insecure"},
+			openvpn.ServerTLSOptions{VerifyClientCertificate: "none", CertificateProfile: "insecure"},
+			certificateVerificationAccepted,
+		)
+	})
+	t.Run("md5_rejected_by_legacy", func(t *testing.T) {
+		runCertificateVerificationSession(t, md5Material,
+			openvpn.ClientTLSOptions{CertificateProfile: "legacy"},
+			openvpn.ServerTLSOptions{VerifyClientCertificate: "none", CertificateProfile: "insecure"},
+			certificateVerificationRejectedByClient,
+		)
+	})
 	rsa1024Material := createCertificateVerificationMaterial(t, certificateVerificationParameters{
 		authorityKey:           rsaAuthority,
 		authoritySignature:     x509.SHA256WithRSA,
@@ -240,6 +263,114 @@ func TestServerCertificateProfileIntegration(t *testing.T) {
 			certificateVerificationRejectedByServer,
 		)
 	})
+	md5Material := createCertificateVerificationMaterial(t, certificateVerificationParameters{
+		authorityKey:           rsaAuthority,
+		authoritySignature:     x509.SHA256WithRSA,
+		serverKey:              generateRSASigner(t, 2048),
+		serverSignature:        x509.SHA256WithRSA,
+		serverKeyUsage:         x509.KeyUsageDigitalSignature,
+		serverExtendedKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		clientKey:              generateRSASigner(t, 2048),
+		clientSignature:        x509.MD5WithRSA,
+	})
+	t.Run("insecure_accepts_md5_client", func(t *testing.T) {
+		runCertificateVerificationSession(t, md5Material,
+			openvpn.ClientTLSOptions{Certificate: md5Material.clientCertificate, Key: md5Material.clientKey, CertificateProfile: "insecure"},
+			openvpn.ServerTLSOptions{CertificateProfile: "insecure"},
+			certificateVerificationAccepted,
+		)
+	})
+	t.Run("legacy_rejects_md5_client", func(t *testing.T) {
+		runCertificateVerificationSession(t, md5Material,
+			openvpn.ClientTLSOptions{Certificate: md5Material.clientCertificate, Key: md5Material.clientKey, CertificateProfile: "insecure"},
+			openvpn.ServerTLSOptions{CertificateProfile: "legacy"},
+			certificateVerificationRejectedByServer,
+		)
+	})
+}
+
+func TestVerifyClientCertificateModesWithoutClientCertificate(t *testing.T) {
+	rsaAuthority := generateRSASigner(t, 2048)
+	material := createCertificateVerificationMaterial(t, certificateVerificationParameters{
+		authorityKey:           rsaAuthority,
+		authoritySignature:     x509.SHA256WithRSA,
+		serverKey:              generateRSASigner(t, 2048),
+		serverSignature:        x509.SHA256WithRSA,
+		serverKeyUsage:         x509.KeyUsageDigitalSignature,
+		serverExtendedKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	})
+	testCases := []struct {
+		mode        string
+		provideCA   bool
+		expectReady bool
+	}{
+		{mode: "none", provideCA: false, expectReady: true},
+		{mode: "optional", provideCA: true, expectReady: true},
+		{mode: "require", provideCA: true, expectReady: false},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.mode, func(t *testing.T) {
+			runClientCertificateModeSession(t, material, testCase.mode, testCase.provideCA, testCase.expectReady)
+		})
+	}
+}
+
+func runClientCertificateModeSession(t *testing.T, material certificateVerificationMaterial, mode string, provideCA bool, expectReady bool) {
+	t.Helper()
+	listenAddress := reserveListenAddressForProtocol(t, "udp")
+	serverTLS := openvpn.ServerTLSOptions{
+		Certificate:             material.serverCertificate,
+		Key:                     material.serverKey,
+		VerifyClientCertificate: mode,
+	}
+	if provideCA {
+		serverTLS.CertificateAuthority = material.certificateAuthority
+	}
+	server, err := openvpn.NewServer(openvpn.ServerOptions{
+		Context: context.Background(),
+		Mode:    openvpn.ModeTLS,
+		Transport: openvpn.ServerTransportOptions{
+			ListenAddress: listenAddress,
+			Protocol:      "udp",
+		},
+		TLS: serverTLS,
+		Tunnel: openvpn.ServerTunnelOptions{
+			AddressPools: []netip.Prefix{netip.MustParsePrefix("10.92.0.0/24")},
+			Topology:     "subnet",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	err = server.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientContext, cancelClient := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancelClient)
+	client, err := openvpn.NewClient(openvpn.ClientOptions{
+		Context:   clientContext,
+		Mode:      openvpn.ModeTLS,
+		Transport: clientTransportOptions(t, listenAddress, "udp"),
+		TLS: openvpn.ClientTLSOptions{
+			CertificateAuthority: material.certificateAuthority,
+		},
+		Pull: openvpn.ClientPullOptions{Enabled: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	err = client.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expectReady {
+		waitForClientReady(t, client, 5*time.Second)
+	} else {
+		assertClientRemainsNotReady(t, client, time.Second)
+	}
 }
 
 func runCertificateVerificationSession(t *testing.T, material certificateVerificationMaterial, clientTLS openvpn.ClientTLSOptions, serverTLS openvpn.ServerTLSOptions, expectedResult certificateVerificationResult) {
@@ -323,7 +454,7 @@ func createCertificateVerificationMaterial(t *testing.T, parameters certificateV
 		BasicConstraintsValid: true,
 		SignatureAlgorithm:    parameters.authoritySignature,
 	}
-	authorityDER, err := x509.CreateCertificate(rand.Reader, authorityTemplate, authorityTemplate, parameters.authorityKey.Public(), parameters.authorityKey)
+	authorityDER, err := createCertificateVerificationCertificate(authorityTemplate, authorityTemplate, parameters.authorityKey.Public(), parameters.authorityKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +472,7 @@ func createCertificateVerificationMaterial(t *testing.T, parameters certificateV
 		UnknownExtKeyUsage: parameters.serverUnknownExtendedUsage,
 		SignatureAlgorithm: parameters.serverSignature,
 	}
-	serverDER, err := x509.CreateCertificate(rand.Reader, serverTemplate, authorityCertificate, parameters.serverKey.Public(), parameters.authorityKey)
+	serverDER, err := createCertificateVerificationCertificate(serverTemplate, authorityCertificate, parameters.serverKey.Public(), parameters.authorityKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,13 +493,81 @@ func createCertificateVerificationMaterial(t *testing.T, parameters certificateV
 		ExtKeyUsage:        []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 		SignatureAlgorithm: parameters.clientSignature,
 	}
-	clientDER, err := x509.CreateCertificate(rand.Reader, clientTemplate, authorityCertificate, parameters.clientKey.Public(), parameters.authorityKey)
+	clientDER, err := createCertificateVerificationCertificate(clientTemplate, authorityCertificate, parameters.clientKey.Public(), parameters.authorityKey)
 	if err != nil {
 		t.Fatal(err)
 	}
 	material.clientCertificate = openvpn.Material{Path: writeTestPEM(t, directory, "client.crt", "CERTIFICATE", clientDER)}
 	material.clientKey = openvpn.Material{Path: writeCertificateVerificationKey(t, directory, "client.key", parameters.clientKey)}
 	return material
+}
+
+var md5WithRSAAlgorithmIdentifier = pkix.AlgorithmIdentifier{
+	Algorithm:  asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 4},
+	Parameters: asn1.RawValue{Tag: 5},
+}
+
+type certificateVerificationASN1 struct {
+	TBSCertificate     asn1.RawValue
+	SignatureAlgorithm pkix.AlgorithmIdentifier
+	SignatureValue     asn1.BitString
+}
+
+func createCertificateVerificationCertificate(template *x509.Certificate, parent *x509.Certificate, publicKey any, parentKey crypto.Signer) ([]byte, error) {
+	if template.SignatureAlgorithm != x509.MD5WithRSA {
+		return x509.CreateCertificate(rand.Reader, template, parent, publicKey, parentKey)
+	}
+	temporaryTemplate := *template
+	temporaryTemplate.SignatureAlgorithm = x509.SHA256WithRSA
+	certificateDER, err := x509.CreateCertificate(rand.Reader, &temporaryTemplate, parent, publicKey, parentKey)
+	if err != nil {
+		return nil, err
+	}
+	var certificate certificateVerificationASN1
+	remaining, err := asn1.Unmarshal(certificateDER, &certificate)
+	if err != nil {
+		return nil, err
+	}
+	if len(remaining) > 0 {
+		return nil, asn1.SyntaxError{Msg: "trailing certificate data"}
+	}
+	var tbsFields []asn1.RawValue
+	remaining, err = asn1.Unmarshal(certificate.TBSCertificate.FullBytes, &tbsFields)
+	if err != nil {
+		return nil, err
+	}
+	if len(remaining) > 0 {
+		return nil, asn1.SyntaxError{Msg: "trailing TBS certificate data"}
+	}
+	signatureAlgorithmIndex := 1
+	if len(tbsFields) > 0 && tbsFields[0].Class == 2 && tbsFields[0].Tag == 0 {
+		signatureAlgorithmIndex = 2
+	}
+	if len(tbsFields) <= signatureAlgorithmIndex {
+		return nil, asn1.StructuralError{Msg: "invalid TBS certificate"}
+	}
+	algorithmDER, err := asn1.Marshal(md5WithRSAAlgorithmIdentifier)
+	if err != nil {
+		return nil, err
+	}
+	tbsFields[signatureAlgorithmIndex] = asn1.RawValue{FullBytes: algorithmDER}
+	tbsDER, err := asn1.Marshal(tbsFields)
+	if err != nil {
+		return nil, err
+	}
+	parentRSAKey, loaded := parentKey.(*rsa.PrivateKey)
+	if !loaded {
+		return nil, x509.ErrUnsupportedAlgorithm
+	}
+	digest := md5.Sum(tbsDER)
+	signature, err := rsa.SignPKCS1v15(nil, parentRSAKey, crypto.MD5, digest[:])
+	if err != nil {
+		return nil, err
+	}
+	certificate.TBSCertificate = asn1.RawValue{FullBytes: tbsDER}
+	certificate.SignatureAlgorithm = md5WithRSAAlgorithmIdentifier
+	certificate.SignatureValue = asn1.BitString{Bytes: signature, BitLength: len(signature) * 8}
+	return asn1.Marshal(certificate)
 }
 
 func writeCertificateVerificationKey(t *testing.T, directory string, fileName string, privateKey crypto.Signer) string {

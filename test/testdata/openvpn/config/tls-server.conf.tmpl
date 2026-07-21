@@ -16,7 +16,9 @@ cipher {{ .Cipher }}
 {{- if .Auth }}
 auth {{ .Auth }}
 {{- end }}
-{{- if .DataCiphers }}
+{{- if .DisableNCP }}
+ncp-disable
+{{- else if .DataCiphers }}
 {{ .DataCiphersDirective }} {{ .DataCiphers }}
 {{- end }}
 {{- if gt .TunMTU 0 }}

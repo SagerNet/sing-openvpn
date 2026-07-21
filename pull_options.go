@@ -26,6 +26,7 @@ type pushedOptionParseError struct {
 type pushedExcludedRoute struct {
 	Name  string
 	Value string
+	Route TunnelRoute
 }
 
 type pushedPingTimeoutAction uint8
@@ -54,9 +55,9 @@ type wirePushedOptions struct {
 	RouteMetric           int
 	RouteMetricSet        bool
 	PingInterval          time.Duration
-	PingIntervalSet       bool
+	PingIntervalEnabled   bool
 	PingRestart           time.Duration
-	PingRestartSet        bool
+	PingRestartEnabled    bool
 	AuthToken             string
 	AuthTokenUser         string
 	PeerID                *uint32
@@ -207,6 +208,9 @@ func decodePushReplyPayloadWithFilters(payload []byte, remoteHost netip.Addr, fi
 			}
 		case "redirect-private":
 			wireOptions.RedirectPrivate = true
+			if optionValue != "" {
+				wireOptions.RedirectGatewayFlags = strings.Fields(optionValue)
+			}
 		case "route-metric":
 			routeMetricValue, err := strconv.Atoi(optionValue)
 			if err == nil && routeMetricValue >= 0 {
@@ -217,13 +221,13 @@ func decodePushReplyPayloadWithFilters(payload []byte, remoteHost netip.Addr, fi
 			pingValue, err := strconv.Atoi(strings.TrimSpace(optionValue))
 			if err == nil && pingValue >= 0 {
 				wireOptions.PingInterval = time.Duration(pingValue) * time.Second
-				wireOptions.PingIntervalSet = true
+				wireOptions.PingIntervalEnabled = true
 			}
 		case "ping-restart":
 			pingRestartValue, err := strconv.Atoi(strings.TrimSpace(optionValue))
 			if err == nil && pingRestartValue >= 0 {
 				wireOptions.PingRestart = time.Duration(pingRestartValue) * time.Second
-				wireOptions.PingRestartSet = true
+				wireOptions.PingRestartEnabled = true
 				wireOptions.PingTimeoutAction = pushedPingTimeoutRestart
 			}
 		case "auth-token":
@@ -352,9 +356,9 @@ func pushedOptionsFromWire(wireOptions wirePushedOptions, remoteHost netip.Addr)
 		RouteMetric:           wireOptions.RouteMetric,
 		RouteMetricSet:        wireOptions.RouteMetricSet,
 		PingInterval:          wireOptions.PingInterval,
-		PingIntervalSet:       wireOptions.PingIntervalSet,
+		PingIntervalEnabled:   wireOptions.PingIntervalEnabled,
 		PingRestart:           wireOptions.PingRestart,
-		PingRestartSet:        wireOptions.PingRestartSet,
+		PingRestartEnabled:    wireOptions.PingRestartEnabled,
 		AuthToken:             wireOptions.AuthToken,
 		AuthTokenUser:         wireOptions.AuthTokenUser,
 		PeerID:                wireOptions.PeerID,
@@ -381,7 +385,7 @@ func pushedOptionsFromWire(wireOptions wirePushedOptions, remoteHost netip.Addr)
 		options.PingExitSet = false
 	case pushedPingTimeoutExit:
 		options.PingRestart = 0
-		options.PingRestartSet = false
+		options.PingRestartEnabled = false
 	}
 	if wireOptions.Ifconfig != "" {
 		options.addWireIfconfig(wireOptions.Ifconfig, wireOptions.Topology)
@@ -399,8 +403,21 @@ func pushedOptionsFromWire(wireOptions wirePushedOptions, remoteHost netip.Addr)
 	for _, value := range wireOptions.DNS {
 		options.addWireDNSOptionV2(value)
 	}
+	options.DNSServers = slices.DeleteFunc(options.DNSServers, func(server TunnelDNSServer) bool {
+		if len(server.Addresses) > 0 {
+			return false
+		}
+		options.addParseError("dns", "server "+strconv.Itoa(server.Priority), E.New("dns server has no address assigned"))
+		return true
+	})
+	options.modernDNS = len(options.DNSServers) > 0
 	for _, value := range wireOptions.DHCPOptions {
-		options.addWireDHCPOptionDNS(value)
+		if !options.modernDNS {
+			options.addWireDHCPOptionDNS(value)
+		}
+	}
+	if options.modernDNS {
+		options.DHCPOptions = filterOpenVPNNonDNSDHCPOptions(options.DHCPOptions)
 	}
 	return options
 }
@@ -472,7 +489,7 @@ func (options *pushedOptions) addWireRoute(value string, remoteHost netip.Addr) 
 		return
 	}
 	if excluded {
-		options.addExcludedRoute("route", raw)
+		options.addExcludedRoute("route", raw, TunnelRoute{Prefix: prefix, Metric: metric})
 		return
 	}
 	options.Routes = append(options.Routes, pushedRoute{
@@ -496,7 +513,7 @@ func (options *pushedOptions) addWireRouteIPv6(value string, remoteHost netip.Ad
 		return
 	}
 	if excluded {
-		options.addExcludedRoute("route-ipv6", raw)
+		options.addExcludedRoute("route-ipv6", raw, TunnelRoute{Prefix: prefix, Metric: metric})
 		return
 	}
 	options.Routes = append(options.Routes, pushedRoute{
@@ -515,33 +532,139 @@ func (options *pushedOptions) addWireDNSOptionV2(value string) {
 		return
 	}
 	fields := strings.Fields(raw)
-	if len(fields) == 0 || !strings.EqualFold(fields[0], "server") {
+	if len(fields) == 0 {
+		return
+	}
+	if strings.EqualFold(fields[0], "search-domains") {
+		if len(fields) < 2 {
+			options.addParseError("dns", raw, E.New("dns search-domains requires domain value"))
+			return
+		}
+		for _, domain := range fields[1:] {
+			if !validateTunnelDNSDomain(domain) {
+				options.addParseError("dns", raw, E.New("dns search domain contains invalid characters: ", domain))
+				continue
+			}
+			options.SearchDomains = appendUniqueStringValues(options.SearchDomains, []string{domain})
+			options.modernSearchDomains = appendUniqueStringValues(options.modernSearchDomains, []string{domain})
+		}
+		return
+	}
+	if !strings.EqualFold(fields[0], "server") {
 		return
 	}
 	if len(fields) < 3 {
 		options.addParseError("dns", raw, E.New("invalid dns server option: ", raw))
 		return
 	}
-	_, err := strconv.Atoi(fields[1])
+	priority, err := strconv.Atoi(fields[1])
 	if err != nil {
 		options.addParseError("dns", raw, E.Cause(err, "parse dns server priority: ", fields[1]))
 		return
 	}
-	if !strings.EqualFold(fields[2], "address") {
+	if priority < 0 || priority > 127 {
+		options.addParseError("dns", raw, E.New("pushed dns server priority must be between 0 and 127"))
 		return
 	}
-	if len(fields) < 4 {
-		options.addParseError("dns", raw, E.New("dns server address requires address value"))
-		return
-	}
-	for _, addressValue := range fields[3:] {
-		address, parseErr := netip.ParseAddr(addressValue)
-		if parseErr != nil {
-			options.addParseError("dns", raw, E.Cause(parseErr, "parse dns server address: ", addressValue))
-			continue
+	server := options.tunnelDNSServer(priority)
+	switch strings.ToLower(fields[2]) {
+	case "address":
+		if len(fields) < 4 {
+			options.addParseError("dns", raw, E.New("dns server address requires address value"))
+			return
 		}
-		options.DNS = append(options.DNS, pushedAddress{Address: address, Raw: raw, OptionName: "dns"})
+		for _, addressValue := range fields[3:] {
+			if len(server.Addresses) >= maxTunnelDNSServerAddresses {
+				options.addParseError("dns", raw, E.New("dns server address maximum exceeded: ", addressValue))
+				return
+			}
+			address, parseErr := parseTunnelDNSAddress(addressValue)
+			if parseErr != nil {
+				options.addParseError("dns", raw, E.Cause(parseErr, "parse dns server address: ", addressValue))
+				continue
+			}
+			server.Addresses = append(server.Addresses, address)
+			modernAddress := pushedAddress{Address: address.Addr(), Raw: raw, OptionName: "dns"}
+			options.DNS = append(options.DNS, modernAddress)
+			options.modernDNSAddresses = append(options.modernDNSAddresses, modernAddress)
+		}
+	case "resolve-domains":
+		if len(fields) < 4 {
+			options.addParseError("dns", raw, E.New("dns server resolve-domains requires domain value"))
+			return
+		}
+		for _, domain := range fields[3:] {
+			if !validateTunnelDNSDomain(domain) {
+				options.addParseError("dns", raw, E.New("dns resolve domain contains invalid characters: ", domain))
+				continue
+			}
+			server.ResolveDomains = appendUniqueStringValues(server.ResolveDomains, []string{domain})
+		}
+	case "dnssec":
+		if len(fields) != 4 {
+			options.addParseError("dns", raw, E.New("dns server dnssec requires one value"))
+			return
+		}
+		dnssec := strings.ToLower(fields[3])
+		switch dnssec {
+		case "yes", "optional", "no":
+			server.DNSSEC = dnssec
+		default:
+			options.addParseError("dns", raw, E.New("invalid dnssec mode: ", fields[3]))
+		}
+	case "transport":
+		if len(fields) != 4 {
+			options.addParseError("dns", raw, E.New("dns server transport requires one value"))
+			return
+		}
+		switch fields[3] {
+		case "plain":
+			server.Transport = "plain"
+		case "DoT":
+			server.Transport = "dot"
+		case "DoH":
+			server.Transport = "doh"
+		default:
+			options.addParseError("dns", raw, E.New("invalid dns transport: ", fields[3]))
+		}
+	case "sni":
+		if len(fields) != 4 {
+			options.addParseError("dns", raw, E.New("dns server sni requires one value"))
+			return
+		}
+		if !validateTunnelDNSDomain(fields[3]) {
+			options.addParseError("dns", raw, E.New("dns server sni contains invalid characters: ", fields[3]))
+			return
+		}
+		server.SNI = fields[3]
+	default:
+		options.addParseError("dns", raw, E.New("unsupported dns server option: ", fields[2]))
 	}
+}
+
+func (options *pushedOptions) tunnelDNSServer(priority int) *TunnelDNSServer {
+	for i := range options.DNSServers {
+		if options.DNSServers[i].Priority == priority {
+			return &options.DNSServers[i]
+		}
+	}
+	options.DNSServers = append(options.DNSServers, TunnelDNSServer{Priority: priority})
+	return &options.DNSServers[len(options.DNSServers)-1]
+}
+
+func parseTunnelDNSAddress(value string) (netip.AddrPort, error) {
+	address, err := netip.ParseAddr(value)
+	if err == nil {
+		return netip.AddrPortFrom(address, 0), nil
+	}
+	addressPort, addressPortErr := netip.ParseAddrPort(value)
+	if addressPortErr != nil {
+		return netip.AddrPort{}, addressPortErr
+	}
+	if addressPort.Port() == 0 {
+		return netip.AddrPort{}, E.New("dns server port must not be zero")
+	}
+	return addressPort, nil
 }
 
 func (options *pushedOptions) addWireDHCPOptionDNS(value string) {
@@ -554,6 +677,34 @@ func (options *pushedOptions) addWireDHCPOptionDNS(value string) {
 		return
 	}
 	optionName := strings.ToUpper(fields[0])
+	if optionName == "DOMAIN" || optionName == "ADAPTER_DOMAIN_SUFFIX" || optionName == "DOMAIN-SEARCH" {
+		if len(fields) < 2 {
+			options.addParseError("dhcp-option", raw, E.New("dhcp-option ", optionName, " requires domain value"))
+			return
+		}
+		for _, domain := range fields[1:] {
+			if !validateTunnelDNSDomain(domain) {
+				options.addParseError("dhcp-option", raw, E.New("dhcp-option ", optionName, " contains invalid domain: ", domain))
+				continue
+			}
+			options.SearchDomains = appendUniqueStringValues(options.SearchDomains, []string{domain})
+		}
+		return
+	}
+	if optionName == "DOMAIN-ROUTE" {
+		if len(fields) < 2 {
+			options.addParseError("dhcp-option", raw, E.New("dhcp-option DOMAIN-ROUTE requires domain value"))
+			return
+		}
+		for _, domain := range fields[1:] {
+			if !validateTunnelDNSDomain(domain) {
+				options.addParseError("dhcp-option", raw, E.New("dhcp-option DOMAIN-ROUTE contains invalid domain: ", domain))
+				continue
+			}
+			options.DNSRoutes = appendUniqueStringValues(options.DNSRoutes, []string{domain})
+		}
+		return
+	}
 	if optionName != "DNS" && optionName != "DNS6" {
 		return
 	}
@@ -579,6 +730,21 @@ func (options *pushedOptions) addWireDHCPOptionDNS(value string) {
 	}
 }
 
+func filterOpenVPNNonDNSDHCPOptions(values []string) []string {
+	return slices.DeleteFunc(slices.Clone(values), func(value string) bool {
+		fields := strings.Fields(value)
+		if len(fields) == 0 {
+			return false
+		}
+		switch strings.ToUpper(fields[0]) {
+		case "DNS", "DNS6", "DOMAIN", "ADAPTER_DOMAIN_SUFFIX", "DOMAIN-SEARCH", "DOMAIN-ROUTE":
+			return true
+		default:
+			return false
+		}
+	})
+}
+
 func (options *pushedOptions) addParseError(name string, value string, err error) {
 	options.parseErrors = append(options.parseErrors, pushedOptionParseError{
 		Name:  name,
@@ -587,10 +753,11 @@ func (options *pushedOptions) addParseError(name string, value string, err error
 	})
 }
 
-func (options *pushedOptions) addExcludedRoute(name string, value string) {
+func (options *pushedOptions) addExcludedRoute(name string, value string, route TunnelRoute) {
 	options.excludedRoutes = append(options.excludedRoutes, pushedExcludedRoute{
 		Name:  name,
 		Value: value,
+		Route: route,
 	})
 }
 

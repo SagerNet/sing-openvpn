@@ -1,11 +1,16 @@
 package openvpn
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // Upstream DEFAULT_SEQ_BACKTRACK/MAX_SEQ_BACKTRACK bound --replay-window.
 const (
 	defaultReplayWindowSize = 64
 	maxReplayWindowSize     = 65536
+	defaultReplayWindowTime = 15 * time.Second
+	maxReplayWindowTime     = 600 * time.Second
 )
 
 type replayWindow struct {
@@ -15,20 +20,19 @@ type replayWindow struct {
 	highestID        uint32
 	highestTimestamp uint32
 	bitmap           []uint64
+	arrivalTimes     []time.Time
+	minimumID        uint32
+	timeWindow       time.Duration
 }
 
 // Upstream --replay-window 0 accepts only strictly monotonic packet IDs.
-func newReplayWindowWithSize(windowSize uint32) *replayWindow {
-	if windowSize > maxReplayWindowSize {
-		windowSize = maxReplayWindowSize
-	}
+func newReplayWindow(windowSize uint32, timeWindow time.Duration) *replayWindow {
 	wordCount := int((uint64(windowSize) + 63) / 64)
-	if wordCount == 0 {
-		wordCount = 1
-	}
 	return &replayWindow{
-		windowSize: windowSize,
-		bitmap:     make([]uint64, wordCount),
+		windowSize:   windowSize,
+		bitmap:       make([]uint64, wordCount),
+		arrivalTimes: make([]time.Time, windowSize),
+		timeWindow:   timeWindow,
 	}
 }
 
@@ -50,26 +54,20 @@ func (w *replayWindow) AcceptLongForm(packetID uint32, timestamp uint32) bool {
 	w.access.Lock()
 	defer w.access.Unlock()
 	if !w.initialized {
-		w.initialized = true
-		w.highestTimestamp = timestamp
-		w.highestID = packetID
-		if w.windowSize > 0 {
-			w.bitmap[0] = 1
+		if w.windowSize == 0 && timestamp > 0 && packetID != 1 {
+			return false
 		}
+		w.initializeLocked(packetID, timestamp)
 		return true
 	}
 	if timestamp < w.highestTimestamp {
 		return false
 	}
 	if timestamp > w.highestTimestamp {
-		w.highestTimestamp = timestamp
-		w.highestID = packetID
-		for i := range w.bitmap {
-			w.bitmap[i] = 0
+		if w.windowSize == 0 && packetID != 1 {
+			return false
 		}
-		if w.windowSize > 0 {
-			w.bitmap[0] = 1
-		}
+		w.initializeLocked(packetID, timestamp)
 		return true
 	}
 	return w.acceptLocked(packetID)
@@ -77,13 +75,17 @@ func (w *replayWindow) AcceptLongForm(packetID uint32, timestamp uint32) bool {
 
 func (w *replayWindow) acceptLocked(packetID uint32) bool {
 	if !w.initialized {
-		w.initialized = true
-		w.highestID = packetID
-		if w.windowSize > 0 {
-			w.bitmap[0] = 1
-		}
+		w.initializeLocked(packetID, 0)
 		return true
 	}
+	if w.windowSize == 0 {
+		if packetID != w.highestID+1 {
+			return false
+		}
+		w.highestID = packetID
+		return true
+	}
+	w.reapLocked()
 	if packetID > w.highestID {
 		shift := packetID - w.highestID
 		if shift >= w.windowSize {
@@ -92,12 +94,20 @@ func (w *replayWindow) acceptLocked(packetID uint32) bool {
 			}
 		} else {
 			shiftReplayBitmap(w.bitmap, shift)
+			shiftReplayTimes(w.arrivalTimes, shift)
 		}
-		if w.windowSize > 0 {
-			w.bitmap[0] |= 1
+		if shift >= w.windowSize {
+			for i := range w.arrivalTimes {
+				w.arrivalTimes[i] = time.Time{}
+			}
 		}
+		w.bitmap[0] |= 1
+		w.arrivalTimes[0] = time.Now()
 		w.highestID = packetID
 		return true
+	}
+	if packetID < w.minimumID {
+		return false
 	}
 	offset := w.highestID - packetID
 	if offset >= w.windowSize {
@@ -110,7 +120,42 @@ func (w *replayWindow) acceptLocked(packetID uint32) bool {
 		return false
 	}
 	w.bitmap[wordIndex] |= packetMask
+	w.arrivalTimes[offset] = time.Now()
 	return true
+}
+
+func (w *replayWindow) initializeLocked(packetID uint32, timestamp uint32) {
+	w.initialized = true
+	w.highestTimestamp = timestamp
+	w.highestID = packetID
+	w.minimumID = 0
+	for i := range w.bitmap {
+		w.bitmap[i] = 0
+	}
+	for i := range w.arrivalTimes {
+		w.arrivalTimes[i] = time.Time{}
+	}
+	if w.windowSize > 0 {
+		w.bitmap[0] = 1
+		w.arrivalTimes[0] = time.Now()
+	}
+}
+
+func (w *replayWindow) reapLocked() {
+	if w.timeWindow <= 0 {
+		return
+	}
+	cutoff := time.Now().Add(-w.timeWindow)
+	for offset, arrivalTime := range w.arrivalTimes {
+		if arrivalTime.IsZero() || !arrivalTime.Before(cutoff) {
+			continue
+		}
+		minimumID := w.highestID - uint32(offset) + 1
+		if minimumID > w.minimumID {
+			w.minimumID = minimumID
+		}
+		return
+	}
 }
 
 func shiftReplayBitmap(bitmap []uint64, shift uint32) {
@@ -127,5 +172,21 @@ func shiftReplayBitmap(bitmap []uint64, shift uint32) {
 			}
 		}
 		bitmap[targetIndex] = result
+	}
+}
+
+func shiftReplayTimes(arrivalTimes []time.Time, shift uint32) {
+	if shift == 0 || len(arrivalTimes) == 0 {
+		return
+	}
+	if shift >= uint32(len(arrivalTimes)) {
+		for i := range arrivalTimes {
+			arrivalTimes[i] = time.Time{}
+		}
+		return
+	}
+	copy(arrivalTimes[shift:], arrivalTimes[:len(arrivalTimes)-int(shift)])
+	for i := range int(shift) {
+		arrivalTimes[i] = time.Time{}
 	}
 }

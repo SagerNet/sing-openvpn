@@ -51,15 +51,6 @@ func NewClient(options ClientOptions) (*Client, error) {
 	if options.Context == nil {
 		options.Context = context.Background()
 	}
-	if options.DataChannel.MSSFix > 0 {
-		options.DataChannel.MSSFixSet = true
-	}
-	if options.Timing.RenegotiationInterval > 0 {
-		options.Timing.RenegotiationIntervalSet = true
-	}
-	if options.Timing.PingRestart > 0 {
-		options.Timing.PingRestartSet = true
-	}
 	remotes, err := resolveClientRemotes(&options)
 	if err != nil {
 		return nil, err
@@ -111,13 +102,16 @@ func NewClient(options ClientOptions) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !options.DataChannel.MSSFixSet {
+	if options.DataChannel.MSSFix == 0 && !options.DataChannel.MSSFixDisabled {
 		if options.DataChannel.Fragment > 0 {
 			options.DataChannel.MSSFix = options.DataChannel.Fragment
+			options.DataChannel.MSSFixMode = MSSFixModeMTU
 		} else if options.DataChannel.MTU == 0 || options.DataChannel.MTU == 1500 {
 			options.DataChannel.MSSFix = defaultMSSFix
+			options.DataChannel.MSSFixMode = MSSFixModeMTU
 		} else {
 			options.DataChannel.MSSFix = options.DataChannel.MTU
+			options.DataChannel.MSSFixMode = MSSFixModeFixed
 		}
 	}
 	if mode == ModeTLS {
@@ -127,22 +121,9 @@ func NewClient(options ClientOptions) (*Client, error) {
 		if options.Timing.HandWindow == 0 {
 			options.Timing.HandWindow = tlsHandshakeTotalDuration
 		}
-		if !options.Timing.RenegotiationIntervalSet {
+		if options.Timing.RenegotiationInterval == 0 && !options.Timing.RenegotiationDisabled {
 			options.Timing.RenegotiationInterval = defaultRenegotiationInterval
 		}
-	}
-	options.DataChannel.Cipher = resolveStaticCipherName(
-		mode,
-		options.DataChannel.Cipher,
-		options.DataChannel.Ciphers,
-	)
-	err = validateDeprecatedCrypto(
-		mode,
-		options.DataChannel.Cipher,
-		options.DataChannel.Auth,
-	)
-	if err != nil {
-		return nil, err
 	}
 	client := &Client{
 		options: options,
@@ -200,7 +181,7 @@ func (c *Client) RestartSession() {
 	session := c.lifecycle.currentSession
 	c.lifecycle.access.Unlock()
 	if session != nil {
-		session.Fail(E.New("openvpn: session restart requested"))
+		session.Fail(E.New("session restart requested"))
 	}
 }
 

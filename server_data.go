@@ -100,7 +100,21 @@ func (s *Server) WriteDataPackets(peerAddress string, packets [][]byte) error {
 	if err != nil {
 		return err
 	}
+	return s.writeDataPackets(peerAddress, packets)
+}
+
+func (s *Server) writeDataPackets(peerAddress string, packets [][]byte) error {
+	if s.static != nil {
+		return s.static.WriteDataPackets(peerAddress, packets)
+	}
 	return s.tls.WriteDataPackets(peerAddress, packets)
+}
+
+func (s *Server) writeDataPacketBuffers(peerAddress string, packetBuffers []*buf.Buffer) error {
+	if s.static != nil {
+		return s.static.WriteDataPacketBuffers(peerAddress, packetBuffers)
+	}
+	return s.tls.WriteDataPacketBuffers(peerAddress, packetBuffers)
 }
 
 func (s *Server) WriteDataPacketByDestination(packet []byte) error {
@@ -137,7 +151,7 @@ func (s *Server) WriteDataPacketsByDestination(packets [][]byte) ([]*RouteMissEr
 		if currentRoute.session != nil {
 			writeErr = currentRoute.session.WriteDataPackets(currentPackets)
 		} else {
-			writeErr = s.tls.WriteDataPackets(currentRoute.peerAddress, currentPackets)
+			writeErr = s.writeDataPackets(currentRoute.peerAddress, currentPackets)
 		}
 		currentPackets = currentPackets[:0]
 		return writeErr
@@ -209,7 +223,7 @@ func (s *Server) WriteDataPacketBuffersByDestination(packetBuffers []*buf.Buffer
 		if currentRoute.session != nil {
 			writeErr = currentRoute.session.WriteDataPacketBuffers(currentPacketBuffers)
 		} else {
-			writeErr = s.tls.WriteDataPacketBuffers(currentRoute.peerAddress, currentPacketBuffers)
+			writeErr = s.writeDataPacketBuffers(currentRoute.peerAddress, currentPacketBuffers)
 		}
 		currentPacketBuffers = nil
 		return writeErr
@@ -309,6 +323,12 @@ func (s *Server) pushIncomingDataBuffers(packetBuffers []ServerDataBuffer) {
 }
 
 func (s *Server) prepareServerDataPlane() error {
+	if s.static != nil {
+		if s.routes == nil {
+			s.routes = newPeerRouteRegistry()
+		}
+		return nil
+	}
 	if len(s.options.Tunnel.AddressPools) == 0 && len(s.options.Tunnel.LocalAddress) == 0 {
 		return nil
 	}
@@ -353,8 +373,65 @@ func firstPrefixByFamily(prefixes []netip.Prefix, ipv4 bool) (netip.Prefix, bool
 	return netip.Prefix{}, false
 }
 
-func (s *tlsServerSession) deliverIncomingPayloads(payloads [][]byte) {
+func (s *tlsServerSession) outgoingDataPayloads(payloads [][]byte, codec dataCodec, packetHeaderSize int) ([][][]byte, error) {
 	parent := s.server.parent
+	dataChannelOptions := parent.options.DataChannel
+	maximumSegmentSize, err := calculateMaximumSegmentSize(
+		dataChannelOptions.MSSFix,
+		dataChannelOptions.MSSFixMode,
+		nil,
+		codec,
+		packetHeaderSize,
+		openVPNOuterTransportOverhead(parent.protocol, s.packetConnection.RemoteAddr()),
+	)
+	if err != nil {
+		return nil, err
+	}
+	outgoingPayloads := make([][][]byte, len(payloads))
+	for i, payload := range payloads {
+		outgoingPayloads[i] = [][]byte{append([]byte{}, clampTCPSegmentMSS(payload, maximumSegmentSize)...)}
+	}
+	return outgoingPayloads, nil
+}
+
+func (s *tlsServerSession) outgoingDataBuffers(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int) ([][]*buf.Buffer, error) {
+	parent := s.server.parent
+	dataChannelOptions := parent.options.DataChannel
+	maximumSegmentSize, err := calculateMaximumSegmentSize(
+		dataChannelOptions.MSSFix,
+		dataChannelOptions.MSSFixMode,
+		nil,
+		codec,
+		packetHeaderSize,
+		openVPNOuterTransportOverhead(parent.protocol, s.packetConnection.RemoteAddr()),
+	)
+	if err != nil {
+		buf.ReleaseMulti(payloads)
+		return nil, err
+	}
+	outgoingPayloads := make([][]*buf.Buffer, len(payloads))
+	for i, payload := range payloads {
+		clampTCPSegmentMSSInPlace(payload.Bytes(), maximumSegmentSize)
+		outgoingPayloads[i] = []*buf.Buffer{payload}
+	}
+	return outgoingPayloads, nil
+}
+
+func (s *tlsServerSession) deliverIncomingPayloads(payloads [][]byte, codec dataCodec, packetHeaderSize int) {
+	parent := s.server.parent
+	dataChannelOptions := parent.options.DataChannel
+	maximumSegmentSize, err := calculateMaximumSegmentSize(
+		dataChannelOptions.MSSFix,
+		dataChannelOptions.MSSFixMode,
+		nil,
+		codec,
+		packetHeaderSize,
+		openVPNOuterTransportOverhead(parent.protocol, s.packetConnection.RemoteAddr()),
+	)
+	if err != nil {
+		parent.incomingPacketDropLog.Log(err)
+		return
+	}
 	packets := make([]ServerDataPacket, 0, len(payloads))
 	ownerships := parent.routes.SourcesOwnedBy(payloads, s.tlsPeerSession)
 	for i, payload := range payloads {
@@ -368,14 +445,28 @@ func (s *tlsServerSession) deliverIncomingPayloads(payloads [][]byte) {
 		}
 		packets = append(packets, ServerDataPacket{
 			PeerAddress: s.peerAddress,
-			Payload:     payload,
+			Payload:     clampTCPSegmentMSS(payload, maximumSegmentSize),
 		})
 	}
 	parent.pushIncomingDataPackets(packets)
 }
 
-func (s *tlsServerSession) deliverIncomingBuffers(payloadBuffers []*buf.Buffer) {
+func (s *tlsServerSession) deliverIncomingBuffers(payloadBuffers []*buf.Buffer, codec dataCodec, packetHeaderSize int) {
 	parent := s.server.parent
+	dataChannelOptions := parent.options.DataChannel
+	maximumSegmentSize, err := calculateMaximumSegmentSize(
+		dataChannelOptions.MSSFix,
+		dataChannelOptions.MSSFixMode,
+		nil,
+		codec,
+		packetHeaderSize,
+		openVPNOuterTransportOverhead(parent.protocol, s.packetConnection.RemoteAddr()),
+	)
+	if err != nil {
+		parent.incomingPacketDropLog.Log(err)
+		buf.ReleaseMulti(payloadBuffers)
+		return
+	}
 	payloads := make([][]byte, len(payloadBuffers))
 	for i, payloadBuffer := range payloadBuffers {
 		payloads[i] = payloadBuffer.Bytes()
@@ -392,6 +483,7 @@ func (s *tlsServerSession) deliverIncomingBuffers(payloadBuffers []*buf.Buffer) 
 			payloadBuffer.Release()
 			continue
 		}
+		clampTCPSegmentMSSInPlace(payloadBuffer.Bytes(), maximumSegmentSize)
 		packetBuffers = append(packetBuffers, ServerDataBuffer{
 			PeerAddress: s.peerAddress,
 			Buffer:      payloadBuffer,

@@ -15,6 +15,8 @@ type clientTunnelState struct {
 	authToken                string
 	authTokenUser            string
 	pulledOptionsReceived    bool
+	modernDNSConfigured      bool
+	modernSearchDomains      []string
 	deferInitialEvent        bool
 	pullFilterRejection      string
 	compressionPushRejection string
@@ -104,7 +106,7 @@ func (c *Client) runTunnelConfigurationDispatcher() {
 }
 
 func (c *Client) failSessionForTunnelConfiguration(err error) {
-	failure := E.Cause(err, "openvpn: apply tunnel configuration")
+	failure := E.Cause(err, "apply tunnel configuration")
 	if c.options.Logger != nil {
 		c.options.Logger.WarnContext(c.options.Context, failure)
 	}
@@ -144,8 +146,9 @@ func (c *Client) applyPushedOptions(options pushedOptions) pushedOptionsApplyRes
 	}
 	c.tunnel.pulledOptionsReceived = true
 	updatedConfiguration := cloneTunnelConfiguration(c.tunnel.configuration)
-	if options.PingRestartSet != options.PingExitSet {
-		if options.PingRestartSet {
+	c.tunnel.modernSearchDomains = appendUniqueStringValues(c.tunnel.modernSearchDomains, options.modernSearchDomains)
+	if options.PingRestartEnabled != options.PingExitSet {
+		if options.PingRestartEnabled {
 			updatedConfiguration.PingExit = 0
 		} else {
 			updatedConfiguration.PingRestart = 0
@@ -154,7 +157,6 @@ func (c *Client) applyPushedOptions(options pushedOptions) pushedOptionsApplyRes
 	if options.Topology != "" {
 		updatedConfiguration.Topology = options.Topology
 	}
-	c.debugPushedExcludedRoutes(options.excludedRoutes)
 	parseErrors := slices.Clone(options.parseErrors)
 	pushedLocalIPv4 := options.localAddressByFamily(true)
 	if len(pushedLocalIPv4) > 0 {
@@ -172,8 +174,24 @@ func (c *Client) applyPushedOptions(options pushedOptions) pushedOptionsApplyRes
 		updatedConfiguration.TunMTU = options.TunMTU
 	}
 	if !c.options.Pull.RouteNoPull {
-		updatedConfiguration.DNS = appendUniqueAddresses(updatedConfiguration.DNS, pushedAddresses(options.DNS))
-		updatedConfiguration.DHCPOptions = appendUniqueStringValues(updatedConfiguration.DHCPOptions, options.DHCPOptions)
+		if options.modernDNS && !c.tunnel.modernDNSConfigured {
+			updatedConfiguration.DNS = nil
+			updatedConfiguration.SearchDomains = slices.Clone(c.tunnel.modernSearchDomains)
+			updatedConfiguration.DNSRoutes = nil
+			updatedConfiguration.DHCPOptions = filterOpenVPNNonDNSDHCPOptions(updatedConfiguration.DHCPOptions)
+			c.tunnel.modernDNSConfigured = true
+		}
+		if c.tunnel.modernDNSConfigured {
+			updatedConfiguration.DNS = appendUniqueAddresses(updatedConfiguration.DNS, pushedAddresses(options.modernDNSAddresses))
+			updatedConfiguration.DNSServers = mergeTunnelDNSServers(updatedConfiguration.DNSServers, options.DNSServers)
+			updatedConfiguration.SearchDomains = appendUniqueStringValues(updatedConfiguration.SearchDomains, options.modernSearchDomains)
+			updatedConfiguration.DHCPOptions = appendUniqueStringValues(updatedConfiguration.DHCPOptions, filterOpenVPNNonDNSDHCPOptions(options.DHCPOptions))
+		} else {
+			updatedConfiguration.DNS = appendUniqueAddresses(updatedConfiguration.DNS, pushedAddresses(options.DNS))
+			updatedConfiguration.DHCPOptions = appendUniqueStringValues(updatedConfiguration.DHCPOptions, options.DHCPOptions)
+			updatedConfiguration.SearchDomains = appendUniqueStringValues(updatedConfiguration.SearchDomains, options.SearchDomains)
+			updatedConfiguration.DNSRoutes = appendUniqueStringValues(updatedConfiguration.DNSRoutes, options.DNSRoutes)
+		}
 		if options.BlockIPv6 {
 			updatedConfiguration.BlockIPv6 = true
 		}
@@ -184,10 +202,10 @@ func (c *Client) applyPushedOptions(options pushedOptions) pushedOptionsApplyRes
 			updatedConfiguration.RouteMetric = options.RouteMetric
 		}
 	}
-	if options.PingIntervalSet {
+	if options.PingIntervalEnabled {
 		updatedConfiguration.PingInterval = options.PingInterval
 	}
-	if options.PingRestartSet {
+	if options.PingRestartEnabled {
 		updatedConfiguration.PingRestart = options.PingRestart
 	}
 	if options.AuthToken != "" {
@@ -245,6 +263,13 @@ func (c *Client) applyPushedOptions(options pushedOptions) pushedOptionsApplyRes
 	if !c.options.Pull.RouteNoPull {
 		updatedConfiguration.IPv4Routes = appendUniqueTunnelRoutes(updatedConfiguration.IPv4Routes, pushedTunnelRoutes(options.routesByFamily(true), updatedConfiguration.RouteMetric))
 		updatedConfiguration.IPv6Routes = appendUniqueTunnelRoutes(updatedConfiguration.IPv6Routes, pushedTunnelRoutes(options.routesByFamily(false), updatedConfiguration.RouteMetric))
+		for _, excludedRoute := range options.excludedRoutes {
+			if excludedRoute.Route.Prefix.Addr().Is4() {
+				updatedConfiguration.ExcludedIPv4Routes = appendUniqueTunnelRoutes(updatedConfiguration.ExcludedIPv4Routes, []TunnelRoute{excludedRoute.Route})
+			} else {
+				updatedConfiguration.ExcludedIPv6Routes = appendUniqueTunnelRoutes(updatedConfiguration.ExcludedIPv6Routes, []TunnelRoute{excludedRoute.Route})
+			}
+		}
 		if options.RedirectGateway {
 			updatedConfiguration.RedirectGateway = options.RedirectGateway
 			updatedConfiguration.RedirectGatewayFlags = slices.Clone(options.RedirectGatewayFlags)
@@ -283,6 +308,26 @@ func (c *Client) applyPushedOptions(options pushedOptions) pushedOptionsApplyRes
 		c.signalTunnelConfigurationEvent()
 	}
 	return applyResult
+}
+
+func mergeTunnelDNSServers(destination []TunnelDNSServer, servers []TunnelDNSServer) []TunnelDNSServer {
+	merged := cloneTunnelDNSServers(destination)
+	for _, server := range servers {
+		server.Addresses = slices.Clone(server.Addresses)
+		server.ResolveDomains = slices.Clone(server.ResolveDomains)
+		serverIndex := slices.IndexFunc(merged, func(existing TunnelDNSServer) bool {
+			return existing.Priority == server.Priority
+		})
+		if serverIndex < 0 {
+			merged = append(merged, server)
+			continue
+		}
+		merged[serverIndex] = server
+	}
+	slices.SortFunc(merged, func(left TunnelDNSServer, right TunnelDNSServer) int {
+		return left.Priority - right.Priority
+	})
+	return merged
 }
 
 func (c *Client) setInitialTunnelEventDeferred(deferred bool) {
@@ -370,17 +415,6 @@ func routeNoPullBlocksOption(optionName string) bool {
 	default:
 		return false
 	}
-}
-
-func (c *Client) debugPushedExcludedRoutes(excludedRoutes []pushedExcludedRoute) {
-	if len(excludedRoutes) == 0 || c.options.Logger == nil {
-		return
-	}
-	ignoredRoutes := make([]string, 0, len(excludedRoutes))
-	for _, excludedRoute := range excludedRoutes {
-		ignoredRoutes = append(ignoredRoutes, excludedRoute.Name+" "+strconv.Quote(excludedRoute.Value))
-	}
-	c.options.Logger.DebugContext(c.options.Context, "ignored pushed routes using net_gateway: ", strings.Join(ignoredRoutes, "; "))
 }
 
 func appendUniqueStringValues(destination []string, values []string) []string {

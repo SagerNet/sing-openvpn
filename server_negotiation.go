@@ -139,14 +139,14 @@ func splitServerPushReplyFields(fields []string) ([][]byte, error) {
 		addition := "," + field
 		if len(current)+len(addition) >= serverPushSafeCapacity {
 			if current == pushReplyPayloadPrefix {
-				return nil, E.New("OpenVPN push option is too long: ", field)
+				return nil, E.New("push option is too long: ", field)
 			}
 			payloads = append(payloads, []byte(current+",push-continuation 2"))
 			current = pushReplyPayloadPrefix
 			multiPush = true
 		}
 		if len(current)+len(addition) >= serverPushSafeCapacity {
-			return nil, E.New("OpenVPN push option is too long: ", field)
+			return nil, E.New("push option is too long: ", field)
 		}
 		current += addition
 	}

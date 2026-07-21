@@ -15,6 +15,11 @@ const (
 	defaultMSSFix             = 1492
 )
 
+const (
+	MSSFixModeMTU   = "mtu"
+	MSSFixModeFixed = "fixed"
+)
+
 // Upstream check_push_request (forward.c) re-sends PUSH_REQUEST every
 // PUSH_REQUEST_INTERVAL seconds until push_request_timeout, which starts at
 // hand-window and is replaced by AUTH_PENDING; this resend is also what keeps
@@ -42,10 +47,11 @@ func effectiveClientPingTimeout(configuration TunnelConfiguration) (time.Duratio
 	return 0, clientPingTimeoutNone
 }
 
-// Upstream applies a 120 second ping-restart while a UDP client waits for its
-// first PUSH_REPLY. An explicitly configured zero disables that default.
 func (c *tlsClient) prePullPingRestart() time.Duration {
-	if c.parent.options.Timing.PingRestartSet {
+	if c.parent.options.Timing.PingRestartDisabled {
+		return 0
+	}
+	if c.parent.options.Timing.PingRestart > 0 {
 		return c.parent.options.Timing.PingRestart
 	}
 	if c.parent.options.Pull.Enabled && strings.HasPrefix(c.remote.remote.Protocol, "udp") {

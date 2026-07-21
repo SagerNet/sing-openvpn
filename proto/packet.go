@@ -97,9 +97,9 @@ type Packet struct {
 }
 
 var (
-	ErrPacketTooShort  = E.New("openvpn packet too short")
-	ErrPacketParse     = E.New("openvpn packet parse error")
-	ErrPacketSerialize = E.New("openvpn packet serialize error")
+	ErrPacketTooShort  = E.New("packet too short")
+	ErrPacketParse     = E.New("packet parse error")
+	ErrPacketSerialize = E.New("packet serialize error")
 )
 
 func NewPacket(opcode Opcode, keyID uint8, payload []byte) *Packet {

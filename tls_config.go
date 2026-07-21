@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/asn1"
+	"encoding/pem"
 	"fmt"
 	"os"
 	"strings"
@@ -13,13 +14,10 @@ import (
 	ctx509 "github.com/google/certificate-transparency-go/x509"
 )
 
-func hasTLSCredentialMaterial(values ...any) bool {
+func hasTLSCredentialMaterial(values ...Material) bool {
 	for _, value := range values {
-		switch typedValue := value.(type) {
-		case Material:
-			if typedValue.IsSet() {
-				return true
-			}
+		if value.IsSet() {
+			return true
 		}
 	}
 	return false
@@ -32,7 +30,7 @@ func resolveVerifyClientCertMode(value string) (tls.ClientAuthType, error) {
 	case "", "require":
 		return tls.RequireAnyClientCert, nil
 	case "optional":
-		return tls.VerifyClientCertIfGiven, nil
+		return tls.RequestClientCert, nil
 	case "none":
 		return tls.NoClientCert, nil
 	default:
@@ -169,6 +167,7 @@ func buildTLSClientConfiguration(options ClientOptions) (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	tlsCipherSuites = applyCertificateProfileTLSCipherDefault(certProfile, tlsCipherSuites)
 	verifier := &peerCertificateVerifier{options: peerCertificateVerifierOptions{
 		Roots:                    rootCAs,
 		KeyUsage:                 resolveVerificationExtKeyUsage(requiredExtUsage, x509.ExtKeyUsageServerAuth),
@@ -239,13 +238,25 @@ func loadOptionalClientCertificate(certificateMaterial Material, key Material, c
 
 func buildTLSServerConfiguration(options ServerOptions) (*tls.Config, error) {
 	tlsOptions := options.TLS
+	if tlsOptions.CRLVerify != "" {
+		_, err := os.Stat(tlsOptions.CRLVerify)
+		if err != nil {
+			return nil, err
+		}
+	}
 	rootCAs, err := loadCertPool(tlsOptions.CertificateAuthority)
 	if err != nil {
 		return nil, err
 	}
-	err = requireCAOrPeerFingerprint(rootCAs, nil)
+	verifyClientCertMode, err := resolveVerifyClientCertMode(tlsOptions.VerifyClientCertificate)
 	if err != nil {
 		return nil, err
+	}
+	if verifyClientCertMode != tls.NoClientCert {
+		err = requireCAOrPeerFingerprint(rootCAs, tlsOptions.PeerFingerprint)
+		if err != nil {
+			return nil, err
+		}
 	}
 	certProfile, err := parseTLSCertProfile(tlsOptions.CertificateProfile)
 	if err != nil {
@@ -256,26 +267,61 @@ func buildTLSServerConfiguration(options ServerOptions) (*tls.Config, error) {
 		return nil, err
 	}
 	certificate := certificates[0]
-	verifyClientCertMode, err := resolveVerifyClientCertMode(tlsOptions.VerifyClientCertificate)
+	requiredKeyUsage, err := parseRemoteCertKeyUsages(tlsOptions.RemoteCertificateKU)
 	if err != nil {
 		return nil, err
 	}
+	requiredExtUsage, err := parseRemoteCertExtKeyUsage(tlsOptions.RemoteCertificateEKU)
+	if err != nil {
+		return nil, err
+	}
+	requireKeyUsageExtension, shorthandExtUsage, err := expandRemoteCertTLS(tlsOptions.RemoteCertificateTLS, "client")
+	if err != nil {
+		return nil, err
+	}
+	requiredExtUsage = mergeExtendedKeyUsage(requiredExtUsage, shorthandExtUsage)
+	tlsVersionMin, tlsVersionMax, err := resolveTLSVersionBounds(tlsOptions.VersionMin, tlsOptions.VersionMax)
+	if err != nil {
+		return nil, err
+	}
+	tlsCipherSuites, err := parseTLSCipherSuites(tlsOptions.Cipher)
+	if err != nil {
+		return nil, err
+	}
+	tlsCurvePreferences, err := parseTLSGroups(tlsOptions.Groups)
+	if err != nil {
+		return nil, err
+	}
+	tlsCipherSuites = applyCertificateProfileTLSCipherDefault(certProfile, tlsCipherSuites)
 	verifier := &peerCertificateVerifier{options: peerCertificateVerifierOptions{
-		Roots:              rootCAs,
-		KeyUsage:           x509.ExtKeyUsageClientAuth,
-		CertificateProfile: certProfile,
+		Roots:                    rootCAs,
+		KeyUsage:                 resolveVerificationExtKeyUsage(requiredExtUsage, x509.ExtKeyUsageClientAuth),
+		VerifyName:               tlsOptions.VerifyX509Name,
+		VerifyNameType:           tlsOptions.VerifyX509Type,
+		PeerFingerprints:         tlsOptions.PeerFingerprint,
+		CRLPath:                  tlsOptions.CRLVerify,
+		RequiredKeyUsage:         requiredKeyUsage,
+		RequireKeyUsageExtension: requireKeyUsageExtension,
+		RequiredExtendedUsage:    requiredExtUsage,
+		NSCertificateType:        tlsOptions.NSCertificateType,
+		CertificateProfile:       certProfile,
 	}}
 	var standardRootCAs *x509.CertPool
 	if rootCAs != nil {
 		standardRootCAs = rootCAs.standard
 	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{certificate},
-		ClientAuth:   verifyClientCertMode,
-		ClientCAs:    standardRootCAs,
-		MinVersion:   tls.VersionTLS12,
-		VerifyPeerCertificate: func(rawCertificates [][]byte, _ [][]*x509.Certificate) error {
-			if verifyClientCertMode == tls.VerifyClientCertIfGiven && len(rawCertificates) == 0 {
+	tlsConfiguration := &tls.Config{
+		Certificates:     []tls.Certificate{certificate},
+		ClientAuth:       verifyClientCertMode,
+		ClientCAs:        standardRootCAs,
+		MinVersion:       tlsVersionMin,
+		MaxVersion:       tlsVersionMax,
+		CipherSuites:     tlsCipherSuites,
+		CurvePreferences: tlsCurvePreferences,
+	}
+	if verifyClientCertMode != tls.NoClientCert {
+		tlsConfiguration.VerifyPeerCertificate = func(rawCertificates [][]byte, _ [][]*x509.Certificate) error {
+			if verifyClientCertMode == tls.RequestClientCert && len(rawCertificates) == 0 {
 				return nil
 			}
 			verifyErr := verifier.Verify(rawCertificates)
@@ -283,13 +329,25 @@ func buildTLSServerConfiguration(options ServerOptions) (*tls.Config, error) {
 				verifyErr = E.Errors(ErrPeerCertificateVerification, verifyErr)
 			}
 			return verifyErr
-		},
-	}, nil
+		}
+	}
+	return tlsConfiguration, nil
+}
+
+func applyCertificateProfileTLSCipherDefault(profile string, cipherSuites []uint16) []uint16 {
+	if profile != "suiteb" || len(cipherSuites) > 0 {
+		return cipherSuites
+	}
+	return []uint16{
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+	}
 }
 
 type certificatePool struct {
-	standard *x509.CertPool
-	legacy   *ctx509.CertPool
+	standard     *x509.CertPool
+	legacy       *ctx509.CertPool
+	certificates []*x509.Certificate
 }
 
 func loadCertPool(certificateAuthority Material) (*certificatePool, error) {
@@ -308,7 +366,27 @@ func loadCertPool(certificateAuthority Material) (*certificatePool, error) {
 	if !legacyPool.AppendCertsFromPEM(certificateAuthorityData) {
 		return nil, E.New("invalid certificate authority bundle")
 	}
-	return &certificatePool{standard: standardPool, legacy: legacyPool}, nil
+	var certificates []*x509.Certificate
+	remaining := certificateAuthorityData
+	for len(remaining) > 0 {
+		pemBlock, rest := pem.Decode(remaining)
+		if pemBlock == nil {
+			break
+		}
+		remaining = rest
+		if pemBlock.Type != "CERTIFICATE" {
+			continue
+		}
+		parsedCertificates, parseErr := x509.ParseCertificates(pemBlock.Bytes)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		certificates = append(certificates, parsedCertificates...)
+	}
+	if len(certificates) == 0 {
+		return nil, E.New("invalid certificate authority bundle")
+	}
+	return &certificatePool{standard: standardPool, legacy: legacyPool, certificates: certificates}, nil
 }
 
 // Upstream options_postprocess_filechecks (options.c) rejects TLS without
@@ -428,6 +506,8 @@ type tlsCipherNamePair struct {
 }
 
 var tlsCipherTranslationTable = []tlsCipherNamePair{
+	{"RC4-SHA", tls.TLS_RSA_WITH_RC4_128_SHA},
+	{"DES-CBC3-SHA", tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA},
 	{"AES128-SHA", tls.TLS_RSA_WITH_AES_128_CBC_SHA},
 	{"AES256-SHA", tls.TLS_RSA_WITH_AES_256_CBC_SHA},
 	{"AES128-SHA256", tls.TLS_RSA_WITH_AES_128_CBC_SHA256},
@@ -435,6 +515,9 @@ var tlsCipherTranslationTable = []tlsCipherNamePair{
 	{"AES256-GCM-SHA384", tls.TLS_RSA_WITH_AES_256_GCM_SHA384},
 	{"ECDHE-ECDSA-AES128-SHA", tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA},
 	{"ECDHE-ECDSA-AES256-SHA", tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA},
+	{"ECDHE-ECDSA-RC4-SHA", tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA},
+	{"ECDHE-RSA-RC4-SHA", tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA},
+	{"ECDHE-RSA-DES-CBC3-SHA", tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA},
 	{"ECDHE-RSA-AES128-SHA", tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA},
 	{"ECDHE-RSA-AES256-SHA", tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA},
 	{"ECDHE-ECDSA-AES128-SHA256", tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256},
@@ -477,7 +560,7 @@ func parseTLSCipherSuites(input string) ([]uint16, error) {
 
 func lookupTLSCipherSuite(token string) (uint16, error) {
 	for _, pair := range tlsCipherTranslationTable {
-		if pair.openSSLName == token {
+		if pair.openSSLName == token || tls.CipherSuiteName(pair.suiteID) == token {
 			return pair.suiteID, nil
 		}
 	}

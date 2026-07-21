@@ -31,7 +31,7 @@ type PacketConnection interface {
 
 const packetConnectionBatchSize = 64
 
-var ErrPacketTooLarge = E.New("openvpn packet too large")
+var ErrPacketTooLarge = E.New("packet too large")
 
 func NewPacketConnection(connection net.Conn, protocol string) (PacketConnection, error) {
 	switch {

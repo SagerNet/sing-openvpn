@@ -23,25 +23,35 @@ func clampTCPSegmentMSS(packet []byte, maxSegmentSize uint16) []byte {
 	if maxSegmentSize == 0 {
 		return packet
 	}
+	clonedPacket := append([]byte{}, packet...)
+	if !clampTCPSegmentMSSInPlace(clonedPacket, maxSegmentSize) {
+		return packet
+	}
+	return clonedPacket
+}
+
+func clampTCPSegmentMSSInPlace(packet []byte, maxSegmentSize uint16) bool {
+	if maxSegmentSize == 0 {
+		return false
+	}
 	effectiveMaxSegmentSize := maxSegmentSize
 	if len(packet) >= 1 && packet[0]>>4 == ipHeaderVersionIPv6 {
 		const ipv6MSSHeaderOverhead = ipv6HeaderLength - ipv4HeaderMinLength
 		if effectiveMaxSegmentSize <= ipv6MSSHeaderOverhead {
-			return packet
+			return false
 		}
 		effectiveMaxSegmentSize -= ipv6MSSHeaderOverhead
 	}
 	tcpHeaderOffset, mssValueOffset, advertisedMSS, hasMSS := locateTCPSYNMSSOption(packet)
 	if !hasMSS || advertisedMSS <= effectiveMaxSegmentSize {
-		return packet
+		return false
 	}
-	clonedPacket := append([]byte{}, packet...)
-	binary.BigEndian.PutUint16(clonedPacket[mssValueOffset:mssValueOffset+2], effectiveMaxSegmentSize)
+	binary.BigEndian.PutUint16(packet[mssValueOffset:mssValueOffset+2], effectiveMaxSegmentSize)
 	checksumOffset := tcpHeaderOffset + 16
-	currentChecksum := binary.BigEndian.Uint16(clonedPacket[checksumOffset : checksumOffset+2])
+	currentChecksum := binary.BigEndian.Uint16(packet[checksumOffset : checksumOffset+2])
 	updatedChecksum := incrementallyUpdateChecksum16(currentChecksum, advertisedMSS, effectiveMaxSegmentSize)
-	binary.BigEndian.PutUint16(clonedPacket[checksumOffset:checksumOffset+2], updatedChecksum)
-	return clonedPacket
+	binary.BigEndian.PutUint16(packet[checksumOffset:checksumOffset+2], updatedChecksum)
+	return true
 }
 
 func locateTCPSYNMSSOption(packet []byte) (tcpHeaderOffset int, mssValueOffset int, advertisedMSS uint16, hasMSS bool) {
@@ -54,6 +64,9 @@ func locateTCPSYNMSSOption(packet []byte) (tcpHeaderOffset int, mssValueOffset i
 		if len(packet) < ipv4HeaderMinLength {
 			return 0, 0, 0, false
 		}
+		if int(binary.BigEndian.Uint16(packet[2:4])) != len(packet) || binary.BigEndian.Uint16(packet[6:8])&0x3fff != 0 {
+			return 0, 0, 0, false
+		}
 		ihl := int(packet[0]&0x0f) * 4
 		if ihl < ipv4HeaderMinLength || ihl > len(packet) {
 			return 0, 0, 0, false
@@ -64,6 +77,9 @@ func locateTCPSYNMSSOption(packet []byte) (tcpHeaderOffset int, mssValueOffset i
 		ipHeaderLength = ihl
 	case ipHeaderVersionIPv6:
 		if len(packet) < ipv6HeaderLength {
+			return 0, 0, 0, false
+		}
+		if int(binary.BigEndian.Uint16(packet[4:6]))+ipv6HeaderLength != len(packet) {
 			return 0, 0, 0, false
 		}
 		if packet[6] != ipProtocolTCP {

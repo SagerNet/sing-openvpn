@@ -96,32 +96,18 @@ func (s *tlsServer) newSession(packetConnection proto.PacketConnection, reservat
 		renegotiate: func(_ *tlsPeerSession, channel *tlsControlChannel, initiator bool) (dataCodec, error) {
 			return session.runRenegotiation(channel, initiator)
 		},
-		onRenegotiated: func(_ *tlsPeerSession) {
-			session.noteRenegotiated()
+		onRenegotiated: func(_ *tlsPeerSession, keyID uint8) {
+			session.noteRenegotiated(keyID)
 		},
 	}
 	session.hooks = tlsPeerHooks{
-		outgoingDataPayloads: func(payloads [][]byte, _ dataCodec, _ int) ([][][]byte, error) {
-			outgoingPayloads := make([][][]byte, len(payloads))
-			for i, payload := range payloads {
-				outgoingPayloads[i] = [][]byte{append([]byte{}, payload...)}
-			}
-			return outgoingPayloads, nil
+		outgoingDataPayloads: session.outgoingDataPayloads,
+		outgoingDataBuffers:  session.outgoingDataBuffers,
+		deliverIncomingPayloads: func(payloads [][]byte, codec dataCodec, packetHeaderSize int) {
+			session.deliverIncomingPayloads(payloads, codec, packetHeaderSize)
 		},
-		outgoingDataBuffers: func(payloads []*buf.Buffer, _ dataCodec, _ int) ([][]*buf.Buffer, error) {
-			outgoingPayloads := make([][]*buf.Buffer, len(payloads))
-			payloadBatch := make([]*buf.Buffer, len(payloads))
-			for i, payload := range payloads {
-				payloadBatch[i] = payload
-				outgoingPayloads[i] = payloadBatch[i : i+1]
-			}
-			return outgoingPayloads, nil
-		},
-		deliverIncomingPayloads: func(payloads [][]byte, _ dataCodec, _ int) {
-			session.deliverIncomingPayloads(payloads)
-		},
-		deliverIncomingBuffers: func(payloads []*buf.Buffer, _ dataCodec, _ int) {
-			session.deliverIncomingBuffers(payloads)
+		deliverIncomingBuffers: func(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int) {
+			session.deliverIncomingBuffers(payloads, codec, packetHeaderSize)
 		},
 		incomingPacketHeadroom: s.parent.options.DataChannel.PacketHeadroom,
 		sessionTerminated: func(_ error) {
@@ -308,11 +294,19 @@ func (s *tlsServerSession) runTLSHandshake(initialControlPacket *proto.Packet) e
 	if err != nil {
 		return err
 	}
-	initialCodec, err := newTLSDataCodec(keyMaterial, true, s.selectedCipher, s.selectedAuth, 0)
+	initialCodec, err := newTLSDataCodec(
+		keyMaterial,
+		true,
+		s.selectedCipher,
+		s.selectedAuth,
+		s.server.parent.protocol,
+		s.server.parent.options.DataChannel.ReplayWindow,
+		s.server.parent.options.DataChannel.ReplayWindowTime,
+	)
 	if err != nil {
 		return err
 	}
-	s.configureRenegotiation()
+	s.configureRenegotiation(s.sessionManager.CurrentKeyID())
 	s.installInitialDataCodec(initialCodec, s.sessionManager.CurrentKeyID())
 	err = s.server.registerAuthenticatedIdentity(s)
 	if err != nil {
@@ -334,9 +328,11 @@ func (s *tlsServerSession) runTLSHandshake(initialControlPacket *proto.Packet) e
 		s.controlChannel.setActivityObservers(readActivityObserver, writeActivityObserver)
 	}
 	s.setDataObservers(
-		s.consumeRenegotiationBudget,
+		s.consumeOutboundRenegotiationBudget,
+		s.consumeInboundRenegotiationCounter,
+		s.consumeInboundRenegotiationUsage,
 		readActivityObserver,
-		func(payloadBytes int) { _ = s.consumeRenegotiationBudget(0, payloadBytes) },
+		nil,
 		writeActivityObserver,
 		nil,
 	)

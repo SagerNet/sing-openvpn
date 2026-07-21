@@ -17,7 +17,6 @@ type staticKeyClientSession struct {
 	remote           clientRemote
 	sessionManager   *proto.SessionManager
 	dataCodec        dataCodec
-	replayWindow     *replayWindow
 	packetConnection proto.PacketConnection
 
 	sessionContext context.Context
@@ -40,12 +39,18 @@ func newStaticKeyClientSession(parent *Client, remote clientRemote) (*staticKeyC
 	if err != nil {
 		return nil, err
 	}
-	codec, err := newDataCodec(
-		parent.mode,
-		parent.options.DataChannel.Cipher,
-		parent.options.DataChannel.Auth,
+	replayWindowSize, replayWindowTime := dataReplayWindowParameters(
+		remote.remote.Protocol,
+		parent.options.DataChannel.ReplayWindow,
+		parent.options.DataChannel.ReplayWindowTime,
+	)
+	codec, err := newStaticKeyDataCodec(
 		parent.options.StaticKey,
 		parent.options.KeyDirection,
+		parent.options.DataChannel.Cipher,
+		parent.options.DataChannel.Auth,
+		replayWindowSize,
+		replayWindowTime,
 	)
 	if err != nil {
 		if !E.IsMulti(err, errClientSessionConfiguration) {
@@ -58,7 +63,6 @@ func newStaticKeyClientSession(parent *Client, remote clientRemote) (*staticKeyC
 		remote:         remote,
 		sessionManager: sessionManager,
 		dataCodec:      codec,
-		replayWindow:   newReplayWindowWithSize(defaultReplayWindowSize),
 		done:           make(chan error, 1),
 	}, nil
 }
@@ -157,7 +161,7 @@ func (s *staticKeyClientSession) WriteDataPackets(packets [][]byte) error {
 	s.writeAccess.Lock()
 	defer s.writeAccess.Unlock()
 	transportHeaderSize := dataTransportHeaderSize(s.remote.remote.Protocol)
-	preparedPayloads, preparationErr := s.parent.outgoingDataPayloadBatches(packets, s.dataCodec, transportHeaderSize)
+	preparedPayloads, preparationErr := s.parent.outgoingDataPayloadBatches(packets, s.dataCodec, transportHeaderSize, openVPNOuterTransportOverhead(s.remote.remote.Protocol, s.packetConnection.RemoteAddr()))
 	preparedPacketCount := 0
 	for _, outgoingPayloads := range preparedPayloads {
 		preparedPacketCount += len(outgoingPayloads)
@@ -249,12 +253,9 @@ func (s *staticKeyClientSession) readLoop() {
 		decodedPayloads := make([][]byte, 0, len(rawPacketBuffers))
 		authenticatedPacketReceived := false
 		for _, rawPacketBuffer := range rawPacketBuffers {
-			packetID, decodedPayload, decodeError := s.dataCodec.Decode(nil, rawPacketBuffer.Bytes())
+			_, decodedPayload, decodeError := s.dataCodec.Decode(nil, rawPacketBuffer.Bytes())
 			if decodeError != nil {
 				s.parent.dataPlane.incomingPacketDropLog.Log(decodeError)
-				continue
-			}
-			if s.replayWindow != nil && !s.replayWindow.Accept(packetID) {
 				continue
 			}
 			authenticatedPacketReceived = true
@@ -269,7 +270,7 @@ func (s *staticKeyClientSession) readLoop() {
 			s.lastInboundTime = time.Now()
 			s.access.Unlock()
 		}
-		s.parent.handleIncomingDataPayloads(decodedPayloads, s.dataCodec, dataTransportHeaderSize(s.remote.remote.Protocol))
+		s.parent.handleIncomingDataPayloads(decodedPayloads, s.dataCodec, dataTransportHeaderSize(s.remote.remote.Protocol), openVPNOuterTransportOverhead(s.remote.remote.Protocol, s.packetConnection.RemoteAddr()))
 		keepaliveErr := s.checkKeepalive(time.Now())
 		if keepaliveErr != nil {
 			s.finish(keepaliveErr)

@@ -9,6 +9,9 @@ import (
 
 type pushedOptions struct {
 	kind                  pushOptionsKind
+	modernDNS             bool
+	modernDNSAddresses    []pushedAddress
+	modernSearchDomains   []string
 	pullFilterRejection   string
 	Topology              string
 	TunMTU                uint32
@@ -18,7 +21,10 @@ type pushedOptions struct {
 	RouteGatewayRaw       string
 	Routes                []pushedRoute
 	DNS                   []pushedAddress
+	DNSServers            []TunnelDNSServer
 	DHCPOptions           []string
+	SearchDomains         []string
+	DNSRoutes             []string
 	BlockIPv6             bool
 	BlockOutsideDNS       bool
 	RedirectGateway       bool
@@ -27,9 +33,9 @@ type pushedOptions struct {
 	RouteMetric           int
 	RouteMetricSet        bool
 	PingInterval          time.Duration
-	PingIntervalSet       bool
+	PingIntervalEnabled   bool
 	PingRestart           time.Duration
-	PingRestartSet        bool
+	PingRestartEnabled    bool
 	AuthToken             string
 	AuthTokenUser         string
 	PeerID                *uint32
@@ -100,6 +106,13 @@ func buildInitialTunnelConfiguration(options ClientOptions) TunnelConfiguration 
 		PingInterval:         options.Timing.PingInterval,
 		PingRestart:          options.Timing.PingRestart,
 	}
+	var parsedDHCPOptions pushedOptions
+	for _, dhcpOption := range options.Tunnel.DHCPOptions {
+		parsedDHCPOptions.addWireDHCPOptionDNS(dhcpOption)
+	}
+	configuration.DNS = pushedAddresses(parsedDHCPOptions.DNS)
+	configuration.SearchDomains = slices.Clone(parsedDHCPOptions.SearchDomains)
+	configuration.DNSRoutes = slices.Clone(parsedDHCPOptions.DNSRoutes)
 	return configuration
 }
 
@@ -115,8 +128,13 @@ func cloneTunnelConfiguration(configuration TunnelConfiguration) TunnelConfigura
 		RouteGateway:         configuration.RouteGateway,
 		IPv4Routes:           slices.Clone(configuration.IPv4Routes),
 		IPv6Routes:           slices.Clone(configuration.IPv6Routes),
+		ExcludedIPv4Routes:   slices.Clone(configuration.ExcludedIPv4Routes),
+		ExcludedIPv6Routes:   slices.Clone(configuration.ExcludedIPv6Routes),
 		DNS:                  slices.Clone(configuration.DNS),
+		DNSServers:           cloneTunnelDNSServers(configuration.DNSServers),
 		DHCPOptions:          slices.Clone(configuration.DHCPOptions),
+		SearchDomains:        slices.Clone(configuration.SearchDomains),
+		DNSRoutes:            slices.Clone(configuration.DNSRoutes),
 		BlockIPv6:            configuration.BlockIPv6,
 		BlockOutsideDNS:      configuration.BlockOutsideDNS,
 		RedirectGateway:      configuration.RedirectGateway,
@@ -141,6 +159,21 @@ func cloneTunnelConfiguration(configuration TunnelConfiguration) TunnelConfigura
 	if configuration.PeerID != nil {
 		peerIDCopy := *configuration.PeerID
 		cloned.PeerID = &peerIDCopy
+	}
+	return cloned
+}
+
+func cloneTunnelDNSServers(servers []TunnelDNSServer) []TunnelDNSServer {
+	cloned := make([]TunnelDNSServer, len(servers))
+	for i, server := range servers {
+		cloned[i] = TunnelDNSServer{
+			Priority:       server.Priority,
+			Addresses:      slices.Clone(server.Addresses),
+			ResolveDomains: slices.Clone(server.ResolveDomains),
+			DNSSEC:         server.DNSSEC,
+			Transport:      server.Transport,
+			SNI:            server.SNI,
+		}
 	}
 	return cloned
 }

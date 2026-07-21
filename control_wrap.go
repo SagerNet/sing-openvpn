@@ -88,7 +88,7 @@ func (c *controlAuthCodec) newSessionCodec() *controlAuthCodec {
 	return &controlAuthCodec{
 		sendKey:      append([]byte(nil), c.sendKey...),
 		receiveKeys:  receiveKeys,
-		receiveState: newReplayWindowWithSize(defaultReplayWindowSize),
+		receiveState: newReplayWindow(defaultReplayWindowSize, defaultReplayWindowTime),
 		hashFactory:  c.hashFactory,
 		digestSize:   c.digestSize,
 	}
@@ -118,7 +118,7 @@ func newControlAuthCodecWithAuth(staticKey Material, keyDirection int, authName 
 	return &controlAuthCodec{
 		sendKey:      sendKey,
 		receiveKeys:  receiveKeys,
-		receiveState: newReplayWindowWithSize(defaultReplayWindowSize),
+		receiveState: newReplayWindow(defaultReplayWindowSize, defaultReplayWindowTime),
 		hashFactory:  hashFactory,
 		digestSize:   digestSize,
 	}, nil
@@ -200,7 +200,7 @@ func (c *controlCryptCodec) newSessionCodec() *controlCryptCodec {
 		sendEncryptBlock:  c.sendEncryptBlock,
 		sendAuthKey:       append([]byte(nil), c.sendAuthKey...),
 		receiveCandidates: receiveCandidates,
-		receiveState:      newReplayWindowWithSize(defaultReplayWindowSize),
+		receiveState:      newReplayWindow(defaultReplayWindowSize, defaultReplayWindowTime),
 	}
 }
 
@@ -249,7 +249,7 @@ func newControlCryptCodecFromMaterial(staticKeyMaterial []byte, keyDirection int
 		sendEncryptBlock:  sendEncryptBlock,
 		sendAuthKey:       sendAuthKey,
 		receiveCandidates: receiveCandidates,
-		receiveState:      newReplayWindowWithSize(defaultReplayWindowSize),
+		receiveState:      newReplayWindow(defaultReplayWindowSize, defaultReplayWindowTime),
 	}, nil
 }
 

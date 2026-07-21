@@ -1,6 +1,7 @@
 package test
 
 import (
+	"bytes"
 	"context"
 	"net/netip"
 	"path/filepath"
@@ -62,7 +63,7 @@ func TestTLSClientInitiatedRenegotiationKeepsDataFlowing(t *testing.T) {
 		},
 		Authentication: ClientAuthenticationOptions{Username: "test-user", Password: "test-password"},
 		Pull:           ClientPullOptions{Enabled: true},
-		Timing:         ClientTimingOptions{RenegotiationPackets: 2},
+		Timing:         ClientTimingOptions{RenegotiationPackets: 16},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -75,11 +76,33 @@ func TestTLSClientInitiatedRenegotiationKeepsDataFlowing(t *testing.T) {
 	waitForClientReady(t, client, 10*time.Second)
 	waitForObservedCredentials(t, credentialEvents, "test-user", "test-password", 10*time.Second)
 
-	err = tryEchoClientThroughServer(client, server, []byte("pre-client-reneg"), 10*time.Second)
+	probePayload := makeIPv4TestPacket("10.8.0.2", "10.8.0.1", []byte("inbound-renegotiation-budget"))
+	err = client.WriteDataPacket(probePayload)
 	if err != nil {
 		t.Fatal(err)
 	}
-	driveEchoUntilObservedCredentials(t, client, server, credentialEvents, "test-user", "test-password", 60*time.Second)
+	serverReadContext, cancelServerRead := context.WithTimeout(context.Background(), 10*time.Second)
+	serverPacket, err := server.ReadDataPacket(serverReadContext)
+	cancelServerRead()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 15 {
+		err = server.WriteDataPacket(serverPacket.PeerAddress, serverPacket.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clientReadContext, cancelClientRead := context.WithTimeout(context.Background(), 10*time.Second)
+		reply, readErr := client.ReadDataPacket(clientReadContext)
+		cancelClientRead()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if !bytes.Equal(reply, probePayload) {
+			t.Fatalf("unexpected inbound payload: %x", reply)
+		}
+	}
+	waitForObservedCredentials(t, credentialEvents, "test-user", "test-password", 60*time.Second)
 	err = tryEchoClientThroughServer(client, server, []byte("post-client-reneg"), 10*time.Second)
 	if err != nil {
 		t.Fatal(err)

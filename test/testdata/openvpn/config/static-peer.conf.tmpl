@@ -20,8 +20,12 @@ persist-key
 persist-tun
 ifconfig {{ .TunnelLocal }} {{ .TunnelRemote }}
 secret {{ .SecretPath }}{{ if ge .KeyDirection 0 }} {{ .KeyDirection }}{{ end }}
+{{- if .Cipher }}
 cipher {{ .Cipher }}
+{{- end }}
+{{- if .Auth }}
 auth {{ .Auth }}
+{{- end }}
 {{- if .ExplicitNotify }}
 explicit-exit-notify 1
 {{- end }}

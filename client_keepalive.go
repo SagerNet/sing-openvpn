@@ -27,13 +27,14 @@ type tlsClientKeepalive struct {
 	renegotiationInProgress bool
 }
 
-func (k *tlsClientKeepalive) configureRenegotiation(selectedCipher string) {
+func (k *tlsClientKeepalive) configureRenegotiation(selectedCipher string, activeKeyID uint8) {
 	k.access.Lock()
 	defer k.access.Unlock()
 	k.renegotiationBudget = newDataRenegotiationBudget(
 		selectedCipher,
 		k.parent.options.Timing.RenegotiationBytes,
 		k.parent.options.Timing.RenegotiationPackets,
+		activeKeyID,
 	)
 	k.renegotiationInterval = k.parent.options.Timing.RenegotiationInterval
 	if k.renegotiationInterval > 0 {
@@ -41,10 +42,10 @@ func (k *tlsClientKeepalive) configureRenegotiation(selectedCipher string) {
 	}
 }
 
-func (k *tlsClientKeepalive) noteRenegotiated() {
+func (k *tlsClientKeepalive) noteRenegotiated(activeKeyID uint8) {
 	k.access.Lock()
 	defer k.access.Unlock()
-	k.renegotiationBudget.reset()
+	k.renegotiationBudget.reset(activeKeyID)
 	if k.renegotiationInterval > 0 {
 		k.renegotiationDeadline = time.Now().Add(k.renegotiationInterval)
 	}
@@ -52,14 +53,51 @@ func (k *tlsClientKeepalive) noteRenegotiated() {
 
 // Upstream should_trigger_renegotiation/key_state_soft_reset (ssl.c)
 // keeps the old key active while a fresh key is negotiated.
-func (k *tlsClientKeepalive) consumeRenegotiationBudget(packetID uint32, payloadBytes int) error {
+func (k *tlsClientKeepalive) consumeOutboundRenegotiationBudget(
+	keyID uint8,
+	packetID uint32,
+	aeadBlockBytes int,
+	accountedBytes int,
+) {
 	k.access.Lock()
-	budgetErr := k.renegotiationBudget.consume(packetID, payloadBytes)
+	transferErr := k.renegotiationBudget.consumeTransfer(keyID, accountedBytes)
+	usageErr := k.renegotiationBudget.consumeUsage(
+		keyID,
+		dataRenegotiationDirectionSend,
+		packetID,
+		aeadBlockBytes,
+	)
+	k.access.Unlock()
+	if transferErr != nil || usageErr != nil {
+		k.requestSoftReset()
+	}
+}
+
+func (k *tlsClientKeepalive) consumeInboundRenegotiationCounter(keyID uint8, accountedBytes int) {
+	k.access.Lock()
+	budgetErr := k.renegotiationBudget.consumeTransfer(keyID, accountedBytes)
 	k.access.Unlock()
 	if budgetErr != nil {
 		k.requestSoftReset()
 	}
-	return nil
+}
+
+func (k *tlsClientKeepalive) consumeInboundRenegotiationUsage(
+	keyID uint8,
+	packetID uint32,
+	aeadBlockBytes int,
+) {
+	k.access.Lock()
+	budgetErr := k.renegotiationBudget.consumeUsage(
+		keyID,
+		dataRenegotiationDirectionReceive,
+		packetID,
+		aeadBlockBytes,
+	)
+	k.access.Unlock()
+	if budgetErr != nil {
+		k.requestSoftReset()
+	}
 }
 
 func (k *tlsClientKeepalive) noteSessionStart() {

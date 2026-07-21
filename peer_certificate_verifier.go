@@ -2,7 +2,10 @@ package openvpn
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/ecdsa"
+	"crypto/md5"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
@@ -13,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
@@ -67,7 +71,9 @@ func (v *peerCertificateVerifier) Verify(rawCertificates [][]byte) error {
 	} else {
 		var err error
 		switch v.options.CertificateProfile {
-		case "insecure", "legacy":
+		case "insecure":
+			verifiedChains, err = verifyInsecureCertificateChain(rawCertificates, v.options.Roots, v.options.KeyUsage)
+		case "legacy":
 			verifiedChains, err = verifyLegacyCertificateChain(rawCertificates, v.options.Roots, v.options.KeyUsage)
 		default:
 			intermediates := x509.NewCertPool()
@@ -122,6 +128,121 @@ func (v *peerCertificateVerifier) Verify(rawCertificates [][]byte) error {
 	return nil
 }
 
+var insecureCertificateValidationKey struct {
+	once sync.Once
+	key  *rsa.PrivateKey
+	err  error
+}
+
+func verifyInsecureCertificateChain(rawCertificates [][]byte, roots *certificatePool, keyUsage x509.ExtKeyUsage) ([][]*x509.Certificate, error) {
+	peerCertificates := make([]*x509.Certificate, 0, len(rawCertificates))
+	for _, rawCertificate := range rawCertificates {
+		peerCertificate, err := x509.ParseCertificate(rawCertificate)
+		if err != nil {
+			return nil, err
+		}
+		peerCertificates = append(peerCertificates, peerCertificate)
+	}
+	insecureCertificateValidationKey.once.Do(func() {
+		insecureCertificateValidationKey.key, insecureCertificateValidationKey.err = rsa.GenerateKey(rand.Reader, 2048)
+	})
+	if insecureCertificateValidationKey.err != nil {
+		return nil, insecureCertificateValidationKey.err
+	}
+	validationKey := insecureCertificateValidationKey.key
+	originalBySynthetic := make(map[*x509.Certificate]*x509.Certificate, len(peerCertificates)+len(roots.certificates))
+	cloneCertificate := func(original *x509.Certificate) (*x509.Certificate, error) {
+		cloned := *original
+		cloned.PublicKeyAlgorithm = x509.RSA
+		cloned.PublicKey = &validationKey.PublicKey
+		cloned.SignatureAlgorithm = x509.SHA256WithRSA
+		digest := sha256.Sum256(cloned.RawTBSCertificate)
+		signature, err := rsa.SignPKCS1v15(nil, validationKey, crypto.SHA256, digest[:])
+		if err != nil {
+			return nil, err
+		}
+		cloned.Signature = signature
+		syntheticCertificate := &cloned
+		originalBySynthetic[syntheticCertificate] = original
+		return syntheticCertificate, nil
+	}
+	syntheticPeerCertificates := make([]*x509.Certificate, 0, len(peerCertificates))
+	for _, peerCertificate := range peerCertificates {
+		syntheticCertificate, err := cloneCertificate(peerCertificate)
+		if err != nil {
+			return nil, err
+		}
+		syntheticPeerCertificates = append(syntheticPeerCertificates, syntheticCertificate)
+	}
+	syntheticIntermediates := x509.NewCertPool()
+	for _, intermediate := range syntheticPeerCertificates[1:] {
+		syntheticIntermediates.AddCert(intermediate)
+	}
+	syntheticRoots := x509.NewCertPool()
+	for _, root := range roots.certificates {
+		syntheticRoot, err := cloneCertificate(root)
+		if err != nil {
+			return nil, err
+		}
+		syntheticRoots.AddCert(syntheticRoot)
+	}
+	syntheticChains, err := syntheticPeerCertificates[0].Verify(x509.VerifyOptions{
+		Roots:         syntheticRoots,
+		Intermediates: syntheticIntermediates,
+		KeyUsages:     []x509.ExtKeyUsage{keyUsage},
+	})
+	if err != nil {
+		return nil, err
+	}
+	verifiedChains := make([][]*x509.Certificate, 0, len(syntheticChains))
+	var signatureErr error
+	for _, syntheticChain := range syntheticChains {
+		chain := make([]*x509.Certificate, 0, len(syntheticChain))
+		for _, syntheticCertificate := range syntheticChain {
+			originalCertificate := originalBySynthetic[syntheticCertificate]
+			if originalCertificate == nil {
+				return nil, E.New("unmapped certificate in verified chain")
+			}
+			chain = append(chain, originalCertificate)
+		}
+		validSignatures := true
+		for certificateIndex := 0; certificateIndex+1 < len(chain); certificateIndex++ {
+			signatureErr = verifyInsecureCertificateSignature(chain[certificateIndex], chain[certificateIndex+1])
+			if signatureErr != nil {
+				validSignatures = false
+				break
+			}
+		}
+		if validSignatures {
+			verifiedChains = append(verifiedChains, chain)
+		}
+	}
+	if len(verifiedChains) == 0 {
+		return nil, signatureErr
+	}
+	return verifiedChains, nil
+}
+
+func verifyInsecureCertificateSignature(certificate *x509.Certificate, parent *x509.Certificate) error {
+	if certificate.SignatureAlgorithm == x509.MD5WithRSA {
+		parentPublicKey, loaded := parent.PublicKey.(*rsa.PublicKey)
+		if !loaded {
+			return x509.ErrUnsupportedAlgorithm
+		}
+		digest := md5.Sum(certificate.RawTBSCertificate)
+		return rsa.VerifyPKCS1v15(parentPublicKey, crypto.MD5, digest[:], certificate.Signature)
+	}
+	legacyCertificate, err := ctx509.ParseCertificate(certificate.Raw)
+	if err != nil {
+		return err
+	}
+	legacyParent, err := ctx509.ParseCertificate(parent.Raw)
+	if err != nil {
+		return err
+	}
+	return legacyCertificate.CheckSignatureFrom(legacyParent)
+}
+
 func enforceCertificateProfile(verifiedChains [][]*x509.Certificate, profile string) error {
 	if len(verifiedChains) == 0 {
 		return nil
@@ -171,6 +292,9 @@ func enforceCertificateProfilePublicKey(peerCertificate *x509.Certificate, profi
 }
 
 func enforceCertificateProfileSignatureAlgorithm(peerCertificate *x509.Certificate, profile string) error {
+	if profile == "insecure" {
+		return nil
+	}
 	signatureAlgorithm := peerCertificate.SignatureAlgorithm
 	if profile == "suiteb" {
 		if signatureAlgorithm != x509.ECDSAWithSHA256 && signatureAlgorithm != x509.ECDSAWithSHA384 {

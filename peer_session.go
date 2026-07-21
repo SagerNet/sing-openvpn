@@ -22,8 +22,14 @@ type tlsRoleCallbacks struct {
 	appendWrappedKey  func(session *tlsPeerSession, rawPacket []byte, opcode proto.Opcode) []byte
 	onTerminate       func(session *tlsPeerSession)
 	renegotiate       func(session *tlsPeerSession, channel *tlsControlChannel, initiator bool) (dataCodec, error)
-	onRenegotiated    func(session *tlsPeerSession)
+	onRenegotiated    func(session *tlsPeerSession, keyID uint8)
 }
+
+type (
+	dataWriteObserver       func(keyID uint8, packetID uint32, aeadBlockBytes int, accountedBytes int)
+	dataReadCounterObserver func(keyID uint8, accountedBytes int)
+	dataReadUsageObserver   func(keyID uint8, packetID uint32, aeadBlockBytes int)
+)
 
 func checkTLSKeySourcesComplete(session *tlsPeerSession) error {
 	if len(session.clientKeySource.PreMaster) != 48 ||
@@ -76,11 +82,13 @@ type tlsPeerSession struct {
 	peerID     *uint32
 	dataAccess sync.Mutex
 
-	dataWriteObserver     func(packetID uint32, payloadBytes int) error
-	readActivityObserver  func()
-	readBytesObserver     func(payloadBytes int)
-	writeActivityObserver func()
-	writeBytesObserver    func(payloadBytes int)
+	dataWriteObserver       dataWriteObserver
+	dataReadCounterObserver dataReadCounterObserver
+	dataReadUsageObserver   dataReadUsageObserver
+	readActivityObserver    func()
+	readBytesObserver       func(payloadBytes int)
+	writeActivityObserver   func()
+	writeBytesObserver      func(payloadBytes int)
 
 	authenticatedDataPacketObserver func() bool
 }

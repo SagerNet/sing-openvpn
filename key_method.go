@@ -414,16 +414,31 @@ func tlsSupportsNCPv2(dataCiphers []string) bool {
 
 func tlsCipherKeyBits(cipherName string) (string, error) {
 	switch cipherName {
-	case "AES-128-GCM", "AES-128-CBC":
+	case "AES-128-GCM", "AES-128-CBC", "AES-128-CFB", "AES-128-OFB",
+		"ARIA-128-CBC", "ARIA-128-CFB", "ARIA-128-OFB",
+		"CAMELLIA-128-CBC", "CAMELLIA-128-CFB", "CAMELLIA-128-OFB",
+		"SEED-CBC", "SEED-CFB", "SEED-OFB", "SM4-CBC", "SM4-CFB", "SM4-OFB":
 		return "128", nil
-	case "AES-192-CBC":
+	case "AES-192-GCM", "AES-192-CBC", "AES-192-CFB", "AES-192-OFB",
+		"ARIA-192-CBC", "ARIA-192-CFB", "ARIA-192-OFB",
+		"CAMELLIA-192-CBC", "CAMELLIA-192-CFB", "CAMELLIA-192-OFB":
 		return "192", nil
-	case "AES-256-GCM", "AES-256-CBC":
+	case "AES-256-GCM", "AES-256-CBC", "AES-256-CFB", "AES-256-OFB",
+		"ARIA-256-CBC", "ARIA-256-CFB", "ARIA-256-OFB",
+		"CAMELLIA-256-CBC", "CAMELLIA-256-CFB", "CAMELLIA-256-OFB":
 		return "256", nil
 	case "CHACHA20-POLY1305":
 		return "256", nil
-	case "BF-CBC":
+	case "BF-CBC", "BF-CFB", "BF-OFB", "CAST5-CBC", "CAST5-CFB", "CAST5-OFB":
 		return "128", nil
+	case "DES-CBC", "DES-CFB", "DES-OFB":
+		return "64", nil
+	case "DES-EDE-CBC", "DES-EDE-CFB", "DES-EDE-OFB":
+		return "128", nil
+	case "DES-EDE3-CBC", "DES-EDE3-CFB", "DES-EDE3-OFB":
+		return "192", nil
+	case "NONE":
+		return "0", nil
 	default:
 		return "", E.New("unsupported cipher")
 	}

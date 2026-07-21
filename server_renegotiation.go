@@ -10,13 +10,14 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
-func (s *tlsServerSession) configureRenegotiation() {
+func (s *tlsServerSession) configureRenegotiation(activeKeyID uint8) {
 	s.renegotiationAccess.Lock()
 	defer s.renegotiationAccess.Unlock()
 	s.renegotiationBudget = newDataRenegotiationBudget(
 		s.selectedCipher,
-		0,
-		0,
+		s.server.parent.options.Timing.RenegotiationBytes,
+		s.server.parent.options.Timing.RenegotiationPackets,
+		activeKeyID,
 	)
 	s.renegotiationInterval = s.server.parent.options.Timing.RenegotiationInterval
 	jitteredDuration := applyServerRenegotiationJitter(s.renegotiationInterval)
@@ -25,10 +26,10 @@ func (s *tlsServerSession) configureRenegotiation() {
 	}
 }
 
-func (s *tlsServerSession) noteRenegotiated() {
+func (s *tlsServerSession) noteRenegotiated(activeKeyID uint8) {
 	s.renegotiationAccess.Lock()
 	defer s.renegotiationAccess.Unlock()
-	s.renegotiationBudget.reset()
+	s.renegotiationBudget.reset(activeKeyID)
 	jitteredDuration := applyServerRenegotiationJitter(s.renegotiationInterval)
 	if jitteredDuration > 0 {
 		s.renegotiationDeadline = time.Now().Add(jitteredDuration)
@@ -37,14 +38,51 @@ func (s *tlsServerSession) noteRenegotiated() {
 
 // Upstream tls_post_encrypt/tls_pre_decrypt (ssl.c) count inbound and
 // outbound bytes against the same renegotiation budget.
-func (s *tlsServerSession) consumeRenegotiationBudget(packetID uint32, payloadBytes int) error {
+func (s *tlsServerSession) consumeOutboundRenegotiationBudget(
+	keyID uint8,
+	packetID uint32,
+	aeadBlockBytes int,
+	accountedBytes int,
+) {
 	s.renegotiationAccess.Lock()
-	budgetErr := s.renegotiationBudget.consume(packetID, payloadBytes)
+	transferErr := s.renegotiationBudget.consumeTransfer(keyID, accountedBytes)
+	usageErr := s.renegotiationBudget.consumeUsage(
+		keyID,
+		dataRenegotiationDirectionSend,
+		packetID,
+		aeadBlockBytes,
+	)
+	s.renegotiationAccess.Unlock()
+	if transferErr != nil || usageErr != nil {
+		s.requestSoftReset()
+	}
+}
+
+func (s *tlsServerSession) consumeInboundRenegotiationCounter(keyID uint8, accountedBytes int) {
+	s.renegotiationAccess.Lock()
+	budgetErr := s.renegotiationBudget.consumeTransfer(keyID, accountedBytes)
 	s.renegotiationAccess.Unlock()
 	if budgetErr != nil {
 		s.requestSoftReset()
 	}
-	return nil
+}
+
+func (s *tlsServerSession) consumeInboundRenegotiationUsage(
+	keyID uint8,
+	packetID uint32,
+	aeadBlockBytes int,
+) {
+	s.renegotiationAccess.Lock()
+	budgetErr := s.renegotiationBudget.consumeUsage(
+		keyID,
+		dataRenegotiationDirectionReceive,
+		packetID,
+		aeadBlockBytes,
+	)
+	s.renegotiationAccess.Unlock()
+	if budgetErr != nil {
+		s.requestSoftReset()
+	}
 }
 
 // Upstream should_trigger_renegotiation/key_state_soft_reset (ssl.c).
@@ -166,7 +204,15 @@ func (s *tlsServerSession) runRenegotiation(channel *tlsControlChannel, initiato
 	if err != nil {
 		return nil, err
 	}
-	newCodec, err := newTLSDataCodec(keyMaterial, true, s.selectedCipher, s.selectedAuth, 0)
+	newCodec, err := newTLSDataCodec(
+		keyMaterial,
+		true,
+		s.selectedCipher,
+		s.selectedAuth,
+		s.server.parent.protocol,
+		s.server.parent.options.DataChannel.ReplayWindow,
+		s.server.parent.options.DataChannel.ReplayWindowTime,
+	)
 	if err != nil {
 		return nil, err
 	}

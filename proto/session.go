@@ -19,7 +19,7 @@ const (
 
 var (
 	ErrMissingRemoteSessionID = E.New("missing remote session id")
-	ErrPacketIDExpired        = E.New("openvpn packet id expired")
+	ErrPacketIDExpired        = E.New("packet id expired")
 	ErrInvalidOpcode          = E.New("invalid opcode for packet creation")
 )
 

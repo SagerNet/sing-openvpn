@@ -296,9 +296,16 @@ func runTLSClientToRealServerScenario(t *testing.T, env interopEnvironment, scen
 	if len(scenario.PeerDataCiphers) > 0 {
 		serverDataCiphers = scenario.PeerDataCiphers
 	}
+	serverCipher := scenario.Cipher
+	disableNCP := false
 	dataCiphersDirective := "data-ciphers"
 	if interopVersionRank(env.version) == 24 {
 		dataCiphersDirective = "ncp-ciphers"
+		if serverCipher == "NONE" {
+			serverCipher = "none"
+			serverDataCiphers = nil
+			disableNCP = true
+		}
 	}
 	tlsCryptV2Option := "allow-noncookie"
 	if scenario.TLSCryptV2ForceCookie {
@@ -315,10 +322,11 @@ func runTLSClientToRealServerScenario(t *testing.T, env interopEnvironment, scen
 		TLSCryptPath:         dockerPathIf(scenario.UseTLSCrypt, "fixtures", "tls-crypt.key"),
 		TLSCryptV2Path:       dockerPathIf(scenario.UseTLSCryptV2, "fixtures", "tls-crypt-v2-server.key"),
 		TLSCryptV2Option:     tlsCryptV2Option,
-		Cipher:               scenario.Cipher,
+		Cipher:               serverCipher,
 		Auth:                 scenario.Auth,
 		DataCiphersDirective: dataCiphersDirective,
 		DataCiphers:          strings.Join(serverDataCiphers, ":"),
+		DisableNCP:           disableNCP,
 		TunMTU:               scenario.PushConfiguration.TunMTU,
 		Fragment:             scenario.Fragment,
 		Compression:          scenario.Compression,

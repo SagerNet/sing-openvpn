@@ -33,6 +33,17 @@ type TunnelRoute struct {
 	Metric  int
 }
 
+type TunnelDNSServer struct {
+	Priority       int
+	Addresses      []netip.AddrPort
+	ResolveDomains []string
+	DNSSEC         string
+	Transport      string
+	SNI            string
+}
+
+const maxTunnelDNSServerAddresses = 8
+
 type TunnelConfigurationEventReason string
 
 const (
@@ -60,7 +71,8 @@ type ClientTransportOptions struct {
 type ClientDataChannelOptions struct {
 	MTU              uint32
 	MSSFix           uint32
-	MSSFixSet        bool
+	MSSFixDisabled   bool
+	MSSFixMode       string
 	Fragment         uint32
 	Cipher           string
 	Ciphers          []string
@@ -70,6 +82,7 @@ type ClientDataChannelOptions struct {
 	CompressionLZO   string
 	AllowCompression string
 	ReplayWindow     uint32
+	ReplayWindowTime time.Duration
 	PacketHeadroom   int
 }
 
@@ -127,15 +140,15 @@ type ClientTunnelOptions struct {
 }
 
 type ClientTimingOptions struct {
-	RenegotiationInterval    time.Duration
-	RenegotiationIntervalSet bool
-	RenegotiationBytes       uint64
-	RenegotiationPackets     uint64
-	PingInterval             time.Duration
-	PingRestart              time.Duration
-	PingRestartSet           bool
-	TLSTimeout               time.Duration
-	HandWindow               time.Duration
+	RenegotiationInterval time.Duration
+	RenegotiationDisabled bool
+	RenegotiationBytes    uint64
+	RenegotiationPackets  uint64
+	PingInterval          time.Duration
+	PingRestart           time.Duration
+	PingRestartDisabled   bool
+	TLSTimeout            time.Duration
+	HandWindow            time.Duration
 }
 
 type ClientOptions struct {
@@ -156,6 +169,7 @@ type ClientOptions struct {
 
 type ServerTransportOptions struct {
 	ListenAddress string
+	RemoteAddress string
 	Listener      net.Listener
 	PacketConn    net.PacketConn
 	Protocol      string
@@ -166,11 +180,17 @@ type ServerResourceOptions struct {
 }
 
 type ServerDataChannelOptions struct {
-	MTU            uint32
-	Ciphers        []string
-	FallbackCipher string
-	Auth           string
-	PacketHeadroom int
+	MTU              uint32
+	MSSFix           uint32
+	MSSFixDisabled   bool
+	MSSFixMode       string
+	Cipher           string
+	Ciphers          []string
+	FallbackCipher   string
+	Auth             string
+	ReplayWindow     uint32
+	ReplayWindowTime time.Duration
+	PacketHeadroom   int
 }
 
 type ServerTLSOptions struct {
@@ -182,7 +202,19 @@ type ServerTLSOptions struct {
 	CryptV2                 Material
 	CryptV2ForceCookie      bool
 	VerifyClientCertificate string
+	VerifyX509Name          string
+	VerifyX509Type          string
+	PeerFingerprint         []string
+	CRLVerify               string
+	RemoteCertificateKU     []string
+	RemoteCertificateEKU    string
+	RemoteCertificateTLS    string
+	NSCertificateType       string
+	VersionMin              string
+	VersionMax              string
 	CertificateProfile      string
+	Cipher                  string
+	Groups                  string
 }
 
 type ServerAuthenticationOptions struct {
@@ -191,27 +223,34 @@ type ServerAuthenticationOptions struct {
 }
 
 type ServerTimingOptions struct {
-	RenegotiationInterval    time.Duration
-	RenegotiationIntervalSet bool
-	HandWindow               time.Duration
-	PingInterval             time.Duration
-	PingRestart              time.Duration
+	RenegotiationInterval time.Duration
+	RenegotiationDisabled bool
+	RenegotiationBytes    uint64
+	RenegotiationPackets  uint64
+	HandWindow            time.Duration
+	PingInterval          time.Duration
+	PingRestart           time.Duration
 }
 
 type ServerTunnelOptions struct {
-	AddressPools []netip.Prefix
-	Topology     string
-	LocalAddress []netip.Prefix
+	AddressPools   []netip.Prefix
+	Topology       string
+	LocalAddress   []netip.Prefix
+	VPNGateway     netip.Addr
+	VPNGatewayIPv6 netip.Addr
 }
 
 type ServerPushOptions struct {
 	Routes               []netip.Prefix
 	DNS                  []netip.Addr
+	DNSServers           []TunnelDNSServer
+	SearchDomains        []string
+	DHCPOptions          []string
 	BlockOutsideDNS      bool
 	PingInterval         time.Duration
-	PingIntervalSet      bool
+	PingIntervalEnabled  bool
 	PingRestart          time.Duration
-	PingRestartSet       bool
+	PingRestartEnabled   bool
 	RedirectGateway      bool
 	RedirectGatewayFlags []string
 }
@@ -227,6 +266,7 @@ type ServerOptions struct {
 	Timing         ServerTimingOptions
 	Tunnel         ServerTunnelOptions
 	Push           ServerPushOptions
+	StaticKey      Material
 	KeyDirection   int
 	Logger         logger.ContextLogger
 }
@@ -241,8 +281,13 @@ type TunnelConfiguration struct {
 	VPNGatewayIPv6       netip.Addr
 	IPv4Routes           []TunnelRoute
 	IPv6Routes           []TunnelRoute
+	ExcludedIPv4Routes   []TunnelRoute
+	ExcludedIPv6Routes   []TunnelRoute
 	DNS                  []netip.Addr
+	DNSServers           []TunnelDNSServer
 	DHCPOptions          []string
+	SearchDomains        []string
+	DNSRoutes            []string
 	BlockIPv6            bool
 	BlockOutsideDNS      bool
 	RedirectGateway      bool
@@ -267,7 +312,7 @@ type TunnelConfiguration struct {
 	PingTimerRemote      bool
 }
 
-var ErrMaterialSourceConflict = E.New("openvpn material path and content are both set")
+var ErrMaterialSourceConflict = E.New("material path and content are both set")
 
 type Material struct {
 	Path    string

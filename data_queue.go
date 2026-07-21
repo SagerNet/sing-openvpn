@@ -22,9 +22,6 @@ type dataPacketQueue[T any] struct {
 }
 
 func newDataPacketQueueWithCapacity[T any](capacity int) *dataPacketQueue[T] {
-	if capacity < 1 {
-		capacity = 1
-	}
 	return &dataPacketQueue[T]{
 		items: make([]T, capacity),
 		wake:  make(chan struct{}, 1),
@@ -155,9 +152,9 @@ func (l *droppedPacketLog) Log(err error) {
 	}
 	droppedCount := l.dropped.Add(1)
 	if droppedCount == 1 {
-		l.logger.WarnContext(l.ctx, "openvpn: dropped invalid data packet: ", err)
+		l.logger.WarnContext(l.ctx, "dropped invalid data packet: ", err)
 	} else if droppedCount%droppedPacketLogInterval == 0 {
-		l.logger.DebugContext(l.ctx, "openvpn: dropped ", droppedCount, " invalid data packets, most recent: ", err)
+		l.logger.DebugContext(l.ctx, "dropped ", droppedCount, " invalid data packets, most recent: ", err)
 	}
 }
 

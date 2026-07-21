@@ -1,8 +1,10 @@
 package openvpn
 
 import (
+	"cmp"
 	"crypto/tls"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -182,7 +184,7 @@ func (s *tlsPeerSession) finishSoftReset(state *tlsRenegotiationState, codec dat
 	}
 	state.finishOnce.Do(func() {
 		var channelsToClose []*tlsControlChannel
-		negotiated := false
+		promoted := false
 
 		s.softResetAccess.Lock()
 		current := s.renegotiations[state.keyID]
@@ -198,19 +200,18 @@ func (s *tlsPeerSession) finishSoftReset(state *tlsRenegotiationState, codec dat
 			}
 			channelsToClose = append(channelsToClose, state.channel)
 		} else {
-			negotiated = true
 			// Upstream selects the newly generated primary key for outbound
 			// data immediately.  Receiving a data packet with the new key is
 			// not a prerequisite; the previous key remains receive-capable as
 			// a lame duck for the transition window.
-			s.promoteKeyStateLocked(state, codec)
+			promoted = s.promoteKeyStateLocked(state, codec)
 			state.resultErr = nil
 			channelsToClose = append(channelsToClose, s.pruneRenegotiationsLocked(time.Now())...)
 		}
 		s.softResetAccess.Unlock()
 
-		if negotiated && s.roleCallbacks.onRenegotiated != nil {
-			s.roleCallbacks.onRenegotiated(s)
+		if promoted && s.roleCallbacks.onRenegotiated != nil {
+			s.roleCallbacks.onRenegotiated(s, state.keyID)
 		}
 		close(state.done)
 		for _, channel := range channelsToClose {
@@ -225,13 +226,13 @@ func (s *tlsPeerSession) makeLameDuckLocked(state *tlsRenegotiationState, now ti
 	s.armKeyStateExpiryLocked(state)
 }
 
-func (s *tlsPeerSession) promoteKeyStateLocked(state *tlsRenegotiationState, codec dataCodec) {
+func (s *tlsPeerSession) promoteKeyStateLocked(state *tlsRenegotiationState, codec dataCodec) bool {
 	if state.sequence <= s.promotedKeyStateSequence {
 		state.status = tlsRenegotiationLameDuck
 		state.expiresAt = time.Now().Add(tlsTransitionWindow)
 		s.installDataKeyState(codec, state.keyID, state.sessionManager, state.sequence, false)
 		s.armKeyStateExpiryLocked(state)
-		return
+		return false
 	}
 	now := time.Now()
 	for _, oldState := range s.renegotiations {
@@ -243,6 +244,7 @@ func (s *tlsPeerSession) promoteKeyStateLocked(state *tlsRenegotiationState, cod
 	s.promotedKeyStateSequence = state.sequence
 	state.status = tlsRenegotiationActive
 	s.installDataKeyState(codec, state.keyID, state.sessionManager, state.sequence, true)
+	return true
 }
 
 func (s *tlsPeerSession) confirmDataKey(keyID uint8) {
@@ -250,6 +252,7 @@ func (s *tlsPeerSession) confirmDataKey(keyID uint8) {
 		return
 	}
 	var channelsToClose []*tlsControlChannel
+	promoted := false
 	s.softResetAccess.Lock()
 	state := s.renegotiations[keyID]
 	if state == nil {
@@ -263,11 +266,14 @@ func (s *tlsPeerSession) confirmDataKey(keyID uint8) {
 		state.peerDataConfirmed = true
 		codec := s.receiveDataCodec(keyID, state.sequence)
 		if codec != nil {
-			s.promoteKeyStateLocked(state, codec)
+			promoted = s.promoteKeyStateLocked(state, codec)
 			channelsToClose = append(channelsToClose, s.pruneRenegotiationsLocked(time.Now())...)
 		}
 	}
 	s.softResetAccess.Unlock()
+	if promoted && s.roleCallbacks.onRenegotiated != nil {
+		s.roleCallbacks.onRenegotiated(s, keyID)
+	}
 	for _, channel := range channelsToClose {
 		_ = channel.Close()
 	}
@@ -313,7 +319,9 @@ func (s *tlsPeerSession) pruneRenegotiationsLocked(now time.Time) []*tlsControlC
 			completed = append(completed, state)
 		}
 	}
-	sortRenegotiationsBySequence(completed)
+	slices.SortStableFunc(completed, func(left *tlsRenegotiationState, right *tlsRenegotiationState) int {
+		return cmp.Compare(left.sequence, right.sequence)
+	})
 	for len(completed) > tlsKeyScanSize {
 		state := completed[0]
 		completed = completed[1:]
@@ -321,14 +329,6 @@ func (s *tlsPeerSession) pruneRenegotiationsLocked(now time.Time) []*tlsControlC
 		channelsToClose = append(channelsToClose, state.channel)
 	}
 	return channelsToClose
-}
-
-func sortRenegotiationsBySequence(states []*tlsRenegotiationState) {
-	for i := 1; i < len(states); i++ {
-		for j := i; j > 0 && states[j].sequence < states[j-1].sequence; j-- {
-			states[j], states[j-1] = states[j-1], states[j]
-		}
-	}
 }
 
 func (s *tlsPeerSession) removeRenegotiationLocked(state *tlsRenegotiationState) {
@@ -422,9 +422,20 @@ const sweet32CipherRenegotiationBytesClamp uint64 = 64 * 1024 * 1024
 // Upstream cipher_kt_insecure (crypto_openssl.c) flags these ciphers.
 var sweet32VulnerableCipherNames = map[string]struct{}{
 	"BF-CBC":       {},
+	"BF-CFB":       {},
+	"BF-OFB":       {},
+	"CAST5-CBC":    {},
+	"CAST5-CFB":    {},
+	"CAST5-OFB":    {},
 	"DES-CBC":      {},
+	"DES-CFB":      {},
+	"DES-OFB":      {},
 	"DES-EDE-CBC":  {},
+	"DES-EDE-CFB":  {},
+	"DES-EDE-OFB":  {},
 	"DES-EDE3-CBC": {},
+	"DES-EDE3-CFB": {},
+	"DES-EDE3-OFB": {},
 	"RC2-CBC":      {},
 	"RC2-40-CBC":   {},
 	"RC2-64-CBC":   {},
@@ -433,50 +444,106 @@ var sweet32VulnerableCipherNames = map[string]struct{}{
 // Upstream init_options (options.c) defaults reneg-sec to 3600.
 const defaultRenegotiationInterval time.Duration = time.Hour
 
-// Upstream tls_limit_reneg_bytes (ssl.c) only applies the SWEET32 clamp
-// when reneg-bytes is unset.
-func resolveRenegotiationBytesBudget(cipherName string, configuredBytes uint64) uint64 {
-	if configuredBytes > 0 {
-		return configuredBytes
-	}
-	if _, found := sweet32VulnerableCipherNames[strings.ToUpper(strings.TrimSpace(cipherName))]; found {
-		return sweet32CipherRenegotiationBytesClamp
-	}
-	return 0
-}
-
 type dataRenegotiationBudget struct {
-	bytesLimit   uint64
-	packetsLimit uint64
-	bytesSent    uint64
-	packetsSent  uint64
+	bytesLimit         uint64
+	packetsLimit       uint64
+	aeadUsageLimit     uint64
+	activeKeyID        uint8
+	bytesTransferred   uint64
+	packetsTransferred uint64
+	sendUsage          dataRenegotiationDirectionUsage
+	receiveUsage       dataRenegotiationDirectionUsage
 }
 
-func newDataRenegotiationBudget(cipherName string, configuredBytes uint64, configuredPackets uint64) dataRenegotiationBudget {
-	return dataRenegotiationBudget{
-		bytesLimit:   resolveRenegotiationBytesBudget(cipherName, configuredBytes),
+type dataRenegotiationDirectionUsage struct {
+	highestPacketID uint32
+	plaintextBlocks uint64
+}
+
+type dataRenegotiationDirection uint8
+
+const (
+	dataRenegotiationDirectionSend dataRenegotiationDirection = iota
+	dataRenegotiationDirectionReceive
+)
+
+const aesGCMUsageLimit = (((uint64(1) << 36) - 1) / 8) * 7
+
+func newDataRenegotiationBudget(
+	cipherName string,
+	configuredBytes uint64,
+	configuredPackets uint64,
+	activeKeyID uint8,
+) dataRenegotiationBudget {
+	normalizedCipherName := strings.ToUpper(strings.TrimSpace(cipherName))
+	bytesLimit := configuredBytes
+	// Upstream tls_limit_reneg_bytes (ssl.c) only applies the SWEET32 clamp
+	// when reneg-bytes is unset.
+	_, sweet32Vulnerable := sweet32VulnerableCipherNames[normalizedCipherName]
+	if bytesLimit == 0 && sweet32Vulnerable {
+		bytesLimit = sweet32CipherRenegotiationBytesClamp
+	}
+	budget := dataRenegotiationBudget{
+		bytesLimit:   bytesLimit,
 		packetsLimit: configuredPackets,
+		activeKeyID:  activeKeyID,
 	}
+	switch normalizedCipherName {
+	case "AES-128-GCM", "AES-192-GCM", "AES-256-GCM":
+		budget.aeadUsageLimit = aesGCMUsageLimit
+	}
+	return budget
 }
 
-func (b *dataRenegotiationBudget) consume(packetID uint32, payloadBytes int) error {
-	if payloadBytes > 0 {
-		b.bytesSent += uint64(payloadBytes)
+func (b *dataRenegotiationBudget) consumeTransfer(keyID uint8, accountedBytes int) error {
+	if keyID != b.activeKeyID {
+		return nil
 	}
-	b.packetsSent++
-	if packetID >= packetIDWrapTrigger {
+	if accountedBytes > 0 {
+		b.bytesTransferred += uint64(accountedBytes)
+	}
+	b.packetsTransferred++
+	if b.bytesLimit > 0 && b.bytesTransferred >= b.bytesLimit {
 		return ErrRenegotiationRequired
 	}
-	if b.bytesLimit > 0 && b.bytesSent >= b.bytesLimit {
-		return ErrRenegotiationRequired
-	}
-	if b.packetsLimit > 0 && b.packetsSent >= b.packetsLimit {
+	if b.packetsLimit > 0 && b.packetsTransferred >= b.packetsLimit {
 		return ErrRenegotiationRequired
 	}
 	return nil
 }
 
-func (b *dataRenegotiationBudget) reset() {
-	b.bytesSent = 0
-	b.packetsSent = 0
+func (b *dataRenegotiationBudget) consumeUsage(
+	keyID uint8,
+	direction dataRenegotiationDirection,
+	packetID uint32,
+	aeadBlockBytes int,
+) error {
+	if keyID != b.activeKeyID {
+		return nil
+	}
+	usage := &b.sendUsage
+	if direction == dataRenegotiationDirectionReceive {
+		usage = &b.receiveUsage
+	}
+	if packetID > usage.highestPacketID {
+		usage.highestPacketID = packetID
+	}
+	if aeadBlockBytes > 0 {
+		usage.plaintextBlocks += (uint64(aeadBlockBytes) + 15) / 16
+	}
+	if direction == dataRenegotiationDirectionSend && packetID >= packetIDWrapTrigger {
+		return ErrRenegotiationRequired
+	}
+	if b.aeadUsageLimit > 0 && usage.plaintextBlocks+uint64(usage.highestPacketID) > b.aeadUsageLimit {
+		return ErrRenegotiationRequired
+	}
+	return nil
+}
+
+func (b *dataRenegotiationBudget) reset(activeKeyID uint8) {
+	b.activeKeyID = activeKeyID
+	b.bytesTransferred = 0
+	b.packetsTransferred = 0
+	b.sendUsage = dataRenegotiationDirectionUsage{}
+	b.receiveUsage = dataRenegotiationDirectionUsage{}
 }

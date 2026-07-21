@@ -42,7 +42,9 @@ func (s *tlsPeerSession) setPeerID(peerID *uint32) {
 }
 
 func (s *tlsPeerSession) setDataObservers(
-	dataWriteObserver func(packetID uint32, payloadBytes int) error,
+	writeObserver dataWriteObserver,
+	readCounterObserver dataReadCounterObserver,
+	readUsageObserver dataReadUsageObserver,
 	readActivityObserver func(),
 	readBytesObserver func(payloadBytes int),
 	writeActivityObserver func(),
@@ -50,20 +52,27 @@ func (s *tlsPeerSession) setDataObservers(
 ) {
 	s.dataAccess.Lock()
 	defer s.dataAccess.Unlock()
-	s.dataWriteObserver = dataWriteObserver
+	s.dataWriteObserver = writeObserver
+	s.dataReadCounterObserver = readCounterObserver
+	s.dataReadUsageObserver = readUsageObserver
 	s.readActivityObserver = readActivityObserver
 	s.readBytesObserver = readBytesObserver
 	s.writeActivityObserver = writeActivityObserver
 	s.writeBytesObserver = writeBytesObserver
 }
 
-func (s *tlsPeerSession) currentReadObservers() (func(), func(payloadBytes int)) {
+func (s *tlsPeerSession) currentReadObservers() (
+	dataReadCounterObserver,
+	dataReadUsageObserver,
+	func(),
+	func(payloadBytes int),
+) {
 	s.dataAccess.Lock()
 	defer s.dataAccess.Unlock()
-	return s.readActivityObserver, s.readBytesObserver
+	return s.dataReadCounterObserver, s.dataReadUsageObserver, s.readActivityObserver, s.readBytesObserver
 }
 
-func (s *tlsPeerSession) currentWriteObservers() (func(packetID uint32, payloadBytes int) error, func(), func(payloadBytes int)) {
+func (s *tlsPeerSession) currentWriteObservers() (dataWriteObserver, func(), func(payloadBytes int)) {
 	s.dataAccess.Lock()
 	defer s.dataAccess.Unlock()
 	return s.dataWriteObserver, s.writeActivityObserver, s.writeBytesObserver
@@ -109,19 +118,26 @@ func (s *tlsPeerSession) handleIncomingDataPackets(packets []*proto.Packet) {
 			header := byte((uint8(packet.Opcode) << 3) | (packet.KeyID & 0x07))
 			aadPrefix = []byte{header, packet.PeerID[0], packet.PeerID[1], packet.PeerID[2]}
 		}
-		_, decodedPayload, err := receiveCodec.DecodeBuffer(aadPrefix, packet.Payload, s.hooks.incomingPacketHeadroom)
+		readCounterObserver, readUsageObserver, readActivityObserver, readBytesObserver := s.currentReadObservers()
+		accountedBytes := len(packet.Payload)
+		if readCounterObserver != nil {
+			readCounterObserver(packet.KeyID, accountedBytes)
+		}
+		packetID, decodedPayload, err := receiveCodec.DecodeBuffer(aadPrefix, packet.Payload, s.hooks.incomingPacketHeadroom)
 		if err != nil {
 			if s.hooks.logDroppedIncomingPacket != nil {
 				s.hooks.logDroppedIncomingPacket(err)
 			}
 			continue
 		}
+		if readUsageObserver != nil {
+			readUsageObserver(packet.KeyID, packetID, decodedPayload.Len())
+		}
 		s.confirmDataKey(packet.KeyID)
 		if authenticatedObserver := s.currentAuthenticatedDataPacketObserver(); authenticatedObserver != nil && !authenticatedObserver() {
 			decodedPayload.Release()
 			continue
 		}
-		readActivityObserver, readBytesObserver := s.currentReadObservers()
 		if readActivityObserver != nil {
 			readActivityObserver()
 		}
@@ -296,9 +312,10 @@ func (s *tlsPeerSession) WriteDataPacket(payload []byte) error {
 }
 
 type tlsOutgoingDataPacket struct {
-	rawPayload   []byte
-	packetID     uint32
-	payloadBytes int
+	rawPayload     []byte
+	packetID       uint32
+	aeadBlockBytes int
+	accountedBytes int
 }
 
 func (s *tlsPeerSession) WriteDataPackets(payloads [][]byte) error {
@@ -393,9 +410,10 @@ func (s *tlsPeerSession) writeDataPacketsLocked(payloads [][]byte) error {
 				break
 			}
 			encodedPackets = append(encodedPackets, tlsOutgoingDataPacket{
-				rawPayload:   rawPacket,
-				packetID:     packetID,
-				payloadBytes: len(outgoingPayload),
+				rawPayload:     rawPacket,
+				packetID:       packetID,
+				aeadBlockBytes: len(encodedPayload) + len(aadPrefix),
+				accountedBytes: len(rawPacket),
 			})
 			lastEncodedPacket[i] = len(encodedPackets) - 1
 		}
@@ -411,16 +429,13 @@ func (s *tlsPeerSession) writeDataPacketsLocked(payloads [][]byte) error {
 	for i, encodedPacket := range encodedPackets {
 		rawPackets[i] = encodedPacket.rawPayload
 	}
-	writtenPackets, writeErr := s.packetConnection.WritePackets(rawPackets)
 	dataWriteObserver, writeActivityObserver, writeBytesObserver := s.currentWriteObservers()
-	for _, encodedPacket := range encodedPackets[:writtenPackets] {
-		if dataWriteObserver != nil {
-			observerErr := dataWriteObserver(encodedPacket.packetID, encodedPacket.payloadBytes)
-			if observerErr != nil {
-				return observerErr
-			}
+	if dataWriteObserver != nil {
+		for _, encodedPacket := range encodedPackets {
+			dataWriteObserver(currentKeyID, encodedPacket.packetID, encodedPacket.aeadBlockBytes, encodedPacket.accountedBytes)
 		}
 	}
+	writtenPackets, writeErr := s.packetConnection.WritePackets(rawPackets)
 	for i, payload := range payloads[:completedPayloads] {
 		if lastEncodedPacket[i] >= writtenPackets {
 			break
@@ -439,9 +454,10 @@ func (s *tlsPeerSession) writeDataPacketsLocked(payloads [][]byte) error {
 }
 
 type tlsOutgoingDataBuffer struct {
-	buffer       *buf.Buffer
-	packetID     uint32
-	payloadBytes int
+	buffer         *buf.Buffer
+	packetID       uint32
+	aeadBlockBytes int
+	accountedBytes int
 }
 
 func (s *tlsPeerSession) writeDataPacketBuffersLocked(payloads []*buf.Buffer) error {
@@ -501,7 +517,6 @@ func (s *tlsPeerSession) writeDataPacketBuffersLocked(payloads []*buf.Buffer) er
 		for j, outgoingPayload := range outgoingPayloads {
 			packetID := uint32(dataPacketIDs[dataPacketIndex])
 			dataPacketIndex++
-			payloadBytes := outgoingPayload.Len()
 			requiredHeadroom := packetHeaderSize + 4 + tlsDataAEADTagSize
 			if outgoingPayload.Start() < requiredHeadroom || outgoingPayload.FreeLen() < tlsDataAEADTagSize {
 				newPayload := buf.NewSize(requiredHeadroom + outgoingPayload.Len() + tlsDataAEADTagSize)
@@ -521,15 +536,17 @@ func (s *tlsPeerSession) writeDataPacketBuffersLocked(payloads []*buf.Buffer) er
 				}
 				return encodeErr
 			}
+			aeadBlockBytes := encodedPayload.Len() + len(aadPrefix)
 			if outgoingOpcode == proto.OpcodeDataV2 {
 				copy(encodedPayload.ExtendHeader(len(aadPrefix)), aadPrefix)
 			} else {
 				encodedPayload.ExtendHeader(1)[0] = byte((uint8(outgoingOpcode) << 3) | (currentKeyID & 0x07))
 			}
 			encodedPackets = append(encodedPackets, tlsOutgoingDataBuffer{
-				buffer:       encodedPayload,
-				packetID:     packetID,
-				payloadBytes: payloadBytes,
+				buffer:         encodedPayload,
+				packetID:       packetID,
+				aeadBlockBytes: aeadBlockBytes,
+				accountedBytes: encodedPayload.Len(),
 			})
 			lastEncodedPacket[i] = len(encodedPackets) - 1
 		}
@@ -538,16 +555,13 @@ func (s *tlsPeerSession) writeDataPacketBuffersLocked(payloads []*buf.Buffer) er
 	for i, encodedPacket := range encodedPackets {
 		packetBuffers[i] = encodedPacket.buffer
 	}
-	writtenPackets, writeErr := s.packetConnection.WritePacketBuffers(packetBuffers)
 	dataWriteObserver, writeActivityObserver, writeBytesObserver := s.currentWriteObservers()
-	for _, encodedPacket := range encodedPackets[:writtenPackets] {
-		if dataWriteObserver != nil {
-			observerErr := dataWriteObserver(encodedPacket.packetID, encodedPacket.payloadBytes)
-			if observerErr != nil {
-				return observerErr
-			}
+	if dataWriteObserver != nil {
+		for _, encodedPacket := range encodedPackets {
+			dataWriteObserver(currentKeyID, encodedPacket.packetID, encodedPacket.aeadBlockBytes, encodedPacket.accountedBytes)
 		}
 	}
+	writtenPackets, writeErr := s.packetConnection.WritePacketBuffers(packetBuffers)
 	for i := range payloads {
 		if lastEncodedPacket[i] >= writtenPackets {
 			break

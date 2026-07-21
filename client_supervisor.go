@@ -19,7 +19,7 @@ const (
 	clientReconnectMaximumBackoff = 60 * time.Second
 )
 
-var errClientSessionConfiguration = E.New("openvpn client session configuration error")
+var errClientSessionConfiguration = E.New("client session configuration error")
 
 type clientSession interface {
 	Initialize(ctx context.Context) error
@@ -70,7 +70,6 @@ func classifyClientSessionError(err error) clientSessionErrorClass {
 		ErrMissingStaticKey,
 		ErrCompressionNotSupported,
 		ErrOptionNotSupported,
-		ErrDeprecatedCryptoDisabled,
 		ErrMissingCAOrPeerFingerprint,
 		ErrInvalidAllowCompression,
 		ErrAllowCompressionConflict,
@@ -373,13 +372,15 @@ func (c *Client) resetSessionConfiguration(remote clientRemote) {
 	c.tunnel.access.Lock()
 	tunnelConfiguration := buildInitialTunnelConfiguration(c.options)
 	tunnelConfiguration.ExplicitExitNotify = c.options.Transport.ExplicitExitNotify
-	if c.options.Pull.Enabled && strings.HasPrefix(remote.remote.Protocol, "udp") && !c.options.Timing.PingRestartSet {
+	if c.options.Pull.Enabled && strings.HasPrefix(remote.remote.Protocol, "udp") && c.options.Timing.PingRestart == 0 && !c.options.Timing.PingRestartDisabled {
 		tunnelConfiguration.PingRestart = prePullInitialPingRestart
 	}
 	tunnelConfiguration.AuthToken = c.tunnel.authToken
 	tunnelConfiguration.AuthTokenUser = c.tunnel.authTokenUser
 	c.tunnel.configuration = tunnelConfiguration
 	c.tunnel.pulledOptionsReceived = false
+	c.tunnel.modernDNSConfigured = false
+	c.tunnel.modernSearchDomains = nil
 	c.tunnel.deferInitialEvent = false
 	c.tunnel.pullFilterRejection = ""
 	c.tunnel.compressionPushRejection = ""

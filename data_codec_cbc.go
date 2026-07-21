@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"hash"
+	"time"
 
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -31,7 +32,7 @@ func (c *tlsCBCDataCodec) EncodedLength(payloadLength int) int {
 	return c.hmacSize + protectedLength
 }
 
-func newTLSCBCDataCodec(keyMaterial []byte, server bool, cipherName string, authName string, replayWindowSize uint32) (dataCodec, error) {
+func newTLSCBCDataCodec(keyMaterial []byte, server bool, cipherName string, authName string, replayWindowSize uint32, replayWindowTime time.Duration) (dataCodec, error) {
 	if len(keyMaterial) < 256 {
 		return nil, E.New("invalid tls key material")
 	}
@@ -66,7 +67,7 @@ func newTLSCBCDataCodec(keyMaterial []byte, server bool, cipherName string, auth
 		receiveHMACKey:  receiveHMACKey,
 		hashFactory:     hashFactory,
 		hmacSize:        hmacSize,
-		replayWindow:    newReplayWindowWithSize(replayWindowSize),
+		replayWindow:    newReplayWindow(replayWindowSize, replayWindowTime),
 	}, nil
 }
 

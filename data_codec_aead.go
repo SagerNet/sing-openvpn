@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"sync"
+	"time"
 
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -32,7 +33,7 @@ func (c *tlsGCMDataCodec) EncodedLength(payloadLength int) int {
 	return 4 + tlsDataAEADTagSize + payloadLength
 }
 
-func newTLSGCMDataCodec(keyMaterial []byte, server bool, cipherName string, replayWindowSize uint32) (dataCodec, error) {
+func newTLSGCMDataCodec(keyMaterial []byte, server bool, cipherName string, replayWindowSize uint32, replayWindowTime time.Duration) (dataCodec, error) {
 	if len(keyMaterial) < 256 {
 		return nil, E.New("invalid tls key material")
 	}
@@ -42,6 +43,8 @@ func newTLSGCMDataCodec(keyMaterial []byte, server bool, cipherName string, repl
 	switch cipherName {
 	case "AES-128-GCM":
 		keySize = 16
+	case "AES-192-GCM":
+		keySize = 24
 	case "AES-256-GCM":
 		keySize = 32
 	default:
@@ -68,11 +71,11 @@ func newTLSGCMDataCodec(keyMaterial []byte, server bool, cipherName string, repl
 		sendIVSuffix:    append([]byte{}, sendSlot.hmacKey[:8]...),
 		receiveAEAD:     receiveAEAD,
 		receiveIVSuffix: append([]byte{}, receiveSlot.hmacKey[:8]...),
-		replayWindow:    newReplayWindowWithSize(replayWindowSize),
+		replayWindow:    newReplayWindow(replayWindowSize, replayWindowTime),
 	}, nil
 }
 
-func newTLSChaCha20Poly1305DataCodec(keyMaterial []byte, server bool, replayWindowSize uint32) (dataCodec, error) {
+func newTLSChaCha20Poly1305DataCodec(keyMaterial []byte, server bool, replayWindowSize uint32, replayWindowTime time.Duration) (dataCodec, error) {
 	if len(keyMaterial) < 256 {
 		return nil, E.New("invalid tls key material")
 	}
@@ -91,7 +94,7 @@ func newTLSChaCha20Poly1305DataCodec(keyMaterial []byte, server bool, replayWind
 		sendIVSuffix:    append([]byte{}, sendSlot.hmacKey[:8]...),
 		receiveAEAD:     receiveAEAD,
 		receiveIVSuffix: append([]byte{}, receiveSlot.hmacKey[:8]...),
-		replayWindow:    newReplayWindowWithSize(replayWindowSize),
+		replayWindow:    newReplayWindow(replayWindowSize, replayWindowTime),
 	}, nil
 }
 

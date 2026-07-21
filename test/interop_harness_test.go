@@ -120,6 +120,7 @@ type tlsServerTemplateData struct {
 	Auth                 string
 	DataCiphersDirective string
 	DataCiphers          string
+	DisableNCP           bool
 	TunMTU               uint32
 	Fragment             uint32
 	MSSFix               uint32
