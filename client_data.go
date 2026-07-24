@@ -1,6 +1,7 @@
 package openvpn
 
 import (
+	"bytes"
 	"context"
 	"sync/atomic"
 
@@ -250,6 +251,11 @@ func (c *Client) handleIncomingDataPayloads(payloads [][]byte, codec dataCodec, 
 			if !complete {
 				continue
 			}
+			// Compression and fragment framing can wrap keepalive pings, so the
+			// peer-level check cannot recognize them before framing is decoded.
+			if bytes.Equal(decodedPayload, openVPNDataChannelPingPayload) {
+				continue
+			}
 		}
 		decodedPayloads = append(decodedPayloads, clampTCPSegmentMSS(decodedPayload, maximumSegmentSize))
 	}
@@ -293,6 +299,9 @@ func (c *Client) handleIncomingDataBuffers(payloads []*buf.Buffer, codec dataCod
 				continue
 			}
 			if !complete {
+				continue
+			}
+			if bytes.Equal(decodedBytes, openVPNDataChannelPingPayload) {
 				continue
 			}
 			decodedPayload = newDataPacketBuffer(c.options.DataChannel.PacketHeadroom, decodedBytes)
