@@ -26,7 +26,13 @@ type replayWindow struct {
 }
 
 // Upstream --replay-window 0 accepts only strictly monotonic packet IDs.
+// Returns nil when windowSize is 0 (TCP mode), enabling callers to
+// skip replay checks entirely — per OpenVPN's documented behaviour that
+// --replay-window only applies to UDP.
 func newReplayWindow(windowSize uint32, timeWindow time.Duration) *replayWindow {
+	if windowSize == 0 {
+		return nil
+	}
 	wordCount := int((uint64(windowSize) + 63) / 64)
 	return &replayWindow{
 		windowSize:   windowSize,
