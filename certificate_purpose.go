@@ -1,6 +1,7 @@
 package openvpn
 
 import (
+	"bytes"
 	"crypto/x509"
 	"encoding/asn1"
 )
@@ -159,8 +160,7 @@ func readCertificateUsageExtensions(certificate *x509.Certificate) (certificateU
 				}
 			}
 		case extension.Id.Equal(netscapeCertTypeExtensionOID):
-			var bitString asn1.BitString
-			_, err := asn1.Unmarshal(extension.Value, &bitString)
+			bitString, err := parseNetscapeCertificateType(extension.Value)
 			if err != nil {
 				return certificateUsageExtensions{}, err
 			}
@@ -189,4 +189,27 @@ func openSSLKeyUsageBits(bitString asn1.BitString) uint {
 		}
 	}
 	return keyUsage
+}
+
+// Match OpenSSL's legacy Netscape cert type decoder: discard nonzero
+// unused padding bits without changing the certificate's signed DER.
+// This compatibility handling is deliberately limited to this extension.
+func parseNetscapeCertificateType(der []byte) (asn1.BitString, error) {
+	var bits asn1.BitString
+	rest, originalErr := asn1.Unmarshal(der, &bits)
+	if originalErr == nil {
+		if len(rest) != 0 {
+			return bits, asn1.SyntaxError{Msg: "trailing Netscape certificate type data"}
+		}
+		return bits, nil
+	}
+	var raw asn1.RawValue
+	rest, err := asn1.Unmarshal(der, &raw)
+	if err != nil || len(rest) != 0 || raw.Class != 0 || raw.Tag != asn1.TagBitString || raw.IsCompound || len(raw.Bytes) < 2 || raw.Bytes[0] > 7 {
+		return bits, originalErr
+	}
+	normalized := bytes.Clone(der)
+	normalized[len(normalized)-1] &^= byte((1 << raw.Bytes[0]) - 1)
+	_, err = asn1.Unmarshal(normalized, &bits)
+	return bits, err
 }
