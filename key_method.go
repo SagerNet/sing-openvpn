@@ -305,6 +305,12 @@ func parseTLSKeyMethod2Payload(payload []byte, server bool) (tlsKeyMethodMessage
 	if err != nil {
 		return tlsKeyMethodMessage{}, err
 	}
+	if server && reader.Len() == 0 {
+		return tlsKeyMethodMessage{
+			OptionsString: optionsString,
+			KeySource:     keySource,
+		}, nil
+	}
 	username, err := readLengthPrefixedString(reader)
 	if err != nil {
 		return tlsKeyMethodMessage{}, err
