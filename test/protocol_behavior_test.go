@@ -15,9 +15,10 @@ func TestMissingProtocolBehavior_AddressPoolAssignsClientIPv4Address(t *testing.
 	t.Parallel()
 	listenAddress := reserveListenAddressForProtocol(t, "udp")
 	server, err := NewServer(ServerOptions{
-		Context:   context.Background(),
-		Mode:      ModeTLS,
-		Transport: ServerTransportOptions{ListenAddress: listenAddress, Protocol: "udp"},
+		NewOutboundQueue: newTestOutboundQueue,
+		Context:          context.Background(),
+		Mode:             ModeTLS,
+		Transport:        ServerTransportOptions{ListenAddress: listenAddress, Protocol: "udp"},
 		TLS: ServerTLSOptions{
 			CertificateAuthority: Material{Path: filepath.Join("testdata", "openvpn", "pki", "ca.crt")},
 			Certificate:          Material{Path: filepath.Join("testdata", "openvpn", "pki", "server.crt")},
@@ -82,9 +83,10 @@ func TestMissingProtocolBehavior_AddressPoolAssignsClientIPv6Address(t *testing.
 	t.Parallel()
 	listenAddress := reserveListenAddressForProtocol(t, "udp")
 	server, err := NewServer(ServerOptions{
-		Context:   context.Background(),
-		Mode:      ModeTLS,
-		Transport: ServerTransportOptions{ListenAddress: listenAddress, Protocol: "udp"},
+		NewOutboundQueue: newTestOutboundQueue,
+		Context:          context.Background(),
+		Mode:             ModeTLS,
+		Transport:        ServerTransportOptions{ListenAddress: listenAddress, Protocol: "udp"},
 		TLS: ServerTLSOptions{
 			CertificateAuthority: Material{Path: filepath.Join("testdata", "openvpn", "pki", "ca.crt")},
 			Certificate:          Material{Path: filepath.Join("testdata", "openvpn", "pki", "server.crt")},

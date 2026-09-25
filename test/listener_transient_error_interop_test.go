@@ -87,8 +87,9 @@ func TestOpenVPNInteropServerKeepsServingAfterRefusedDatagramRead(t *testing.T) 
 	serverContext, cancelServer := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancelServer()
 	server, err := openvpn.NewServer(openvpn.ServerOptions{
-		Context: serverContext,
-		Mode:    openvpn.ModeTLS,
+		NewOutboundQueue: newTestOutboundQueue,
+		Context:          serverContext,
+		Mode:             openvpn.ModeTLS,
 		Transport: openvpn.ServerTransportOptions{
 			PacketConn: faultyListener,
 			Protocol:   "udp4",
@@ -162,8 +163,9 @@ func TestOpenVPNInteropServerKeepsAcceptingAfterRefusedAccept(t *testing.T) {
 	serverContext, cancelServer := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancelServer()
 	server, err := openvpn.NewServer(openvpn.ServerOptions{
-		Context: serverContext,
-		Mode:    openvpn.ModeTLS,
+		NewOutboundQueue: newTestOutboundQueue,
+		Context:          serverContext,
+		Mode:             openvpn.ModeTLS,
 		Transport: openvpn.ServerTransportOptions{
 			Listener: faultyListener,
 			Protocol: "tcp4",

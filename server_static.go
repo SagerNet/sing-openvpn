@@ -23,6 +23,7 @@ type staticKeyServer struct {
 	packetLink      *staticServerPacketLink
 	access          sync.RWMutex
 	peerAddress     string
+	outboundQueue   OutboundQueue
 	readLoopDone    chan struct{}
 }
 
@@ -32,9 +33,11 @@ func newStaticKeyServer(parent *Server) *staticKeyServer {
 
 func (s *staticKeyServer) Start() error {
 	s.loopContext, s.cancelLoop = context.WithCancel(s.parent.options.Context)
+	s.outboundQueue = s.parent.options.NewOutboundQueue(s.writeQueuedPackets)
 	remote, err := s.prepareTransport()
 	if err != nil {
 		s.cancelLoop()
+		_ = s.outboundQueue.Close()
 		return err
 	}
 	client, err := NewClient(ClientOptions{
@@ -66,21 +69,26 @@ func (s *staticKeyServer) Start() error {
 			PingInterval: s.parent.options.Timing.PingInterval,
 			PingRestart:  s.parent.options.Timing.PingRestart,
 		},
-		StaticKey:    s.parent.options.StaticKey,
-		KeyDirection: s.parent.options.KeyDirection,
-		Logger:       s.parent.options.Logger,
+		StaticKey:              s.parent.options.StaticKey,
+		KeyDirection:           s.parent.options.KeyDirection,
+		IncomingPacketHeadroom: s.parent.options.IncomingPacketHeadroom,
+		Logger:                 s.parent.options.Logger,
 	})
 	if err != nil {
 		s.closeTransport()
 		s.cancelLoop()
+		_ = s.outboundQueue.Close()
 		return err
 	}
+	s.access.Lock()
 	s.client = client
+	s.access.Unlock()
 	err = client.Start()
 	if err != nil {
 		s.closeTransport()
 		s.cancelLoop()
 		_ = client.Close()
+		_ = s.outboundQueue.Close()
 		return err
 	}
 	s.readLoopDone = make(chan struct{})
@@ -172,15 +180,26 @@ func (s *staticKeyServer) dialContext(ctx context.Context, network string, addre
 	return packetLink.newSession(), nil
 }
 
+func (s *staticKeyServer) writeQueuedPackets(buffers []*buf.Buffer) {
+	s.access.RLock()
+	client := s.client
+	s.access.RUnlock()
+	if client == nil {
+		buf.ReleaseMulti(buffers)
+		return
+	}
+	_ = client.WriteDataPacketBuffers(buffers)
+}
+
 func (s *staticKeyServer) setPeerAddress(peerAddress string) {
 	s.access.Lock()
 	s.peerAddress = peerAddress
 	s.access.Unlock()
 	if s.parent.options.Tunnel.VPNGateway.IsValid() {
-		s.parent.routes.Register(s.parent.options.Tunnel.VPNGateway, peerAddress, nil)
+		s.parent.routes.Register(s.parent.options.Tunnel.VPNGateway, nil, s.outboundQueue)
 	}
 	if s.parent.options.Tunnel.VPNGatewayIPv6.IsValid() {
-		s.parent.routes.Register(s.parent.options.Tunnel.VPNGatewayIPv6, peerAddress, nil)
+		s.parent.routes.Register(s.parent.options.Tunnel.VPNGatewayIPv6, nil, s.outboundQueue)
 	}
 }
 
@@ -193,15 +212,16 @@ func (s *staticKeyServer) currentPeerAddress() string {
 func (s *staticKeyServer) readLoop() {
 	defer close(s.readLoopDone)
 	for {
-		packet, err := s.client.ReadDataPacket(s.loopContext)
+		packetBuffer, err := s.client.ReadDataPacketBuffer(s.loopContext)
 		if err != nil {
 			return
 		}
 		peerAddress := s.currentPeerAddress()
-		if peerAddress == "" || !s.validSource(packet) {
+		if peerAddress == "" || !s.validSource(packetBuffer.Bytes()) {
+			packetBuffer.Release()
 			continue
 		}
-		s.parent.pushIncomingDataPackets([]ServerDataPacket{{PeerAddress: peerAddress, Payload: packet}})
+		s.parent.pushIncomingDataBuffers([]ServerDataBuffer{{PeerAddress: peerAddress, Buffer: packetBuffer}})
 	}
 }
 
@@ -219,19 +239,11 @@ func (s *staticKeyServer) validSource(packet []byte) bool {
 	return false
 }
 
-func (s *staticKeyServer) WriteDataPackets(peerAddress string, packets [][]byte) error {
+func (s *staticKeyServer) peerOutboundQueue(peerAddress string) (OutboundQueue, error) {
 	if peerAddress == "" || peerAddress != s.currentPeerAddress() {
-		return ErrPeerNotFound
+		return nil, ErrPeerNotFound
 	}
-	return s.client.WriteDataPackets(packets)
-}
-
-func (s *staticKeyServer) WriteDataPacketBuffers(peerAddress string, packetBuffers []*buf.Buffer) error {
-	if peerAddress == "" || peerAddress != s.currentPeerAddress() {
-		buf.ReleaseMulti(packetBuffers)
-		return ErrPeerNotFound
-	}
-	return s.client.WriteDataPacketBuffers(packetBuffers)
+	return s.outboundQueue, nil
 }
 
 func (s *staticKeyServer) Close() error {
@@ -241,6 +253,9 @@ func (s *staticKeyServer) Close() error {
 	closeErr := s.closeTransport()
 	if s.client != nil {
 		closeErr = E.Errors(closeErr, s.client.Close())
+	}
+	if s.outboundQueue != nil {
+		closeErr = E.Errors(closeErr, s.outboundQueue.Close())
 	}
 	if s.readLoopDone != nil {
 		<-s.readLoopDone

@@ -19,9 +19,10 @@ func TestTLSUDPPeerIDNATRebindingAndHijackResistance(t *testing.T) {
 	serverContext, cancelServer := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancelServer()
 	server, err := NewServer(ServerOptions{
-		Context:   serverContext,
-		Mode:      ModeTLS,
-		Transport: ServerTransportOptions{PacketConn: serverTransport, Protocol: "udp"},
+		NewOutboundQueue: newTestOutboundQueue,
+		Context:          serverContext,
+		Mode:             ModeTLS,
+		Transport:        ServerTransportOptions{PacketConn: serverTransport, Protocol: "udp"},
 		TLS: ServerTLSOptions{
 			CertificateAuthority: Material{Path: filepath.Join("testdata", "openvpn", "pki", "ca.crt")},
 			Certificate:          Material{Path: filepath.Join("testdata", "openvpn", "pki", "server.crt")},

@@ -18,7 +18,7 @@ type tlsPeerHooks struct {
 	decodeIncomingFraming    func(payload *buf.Buffer) (*buf.Buffer, bool, error)
 	deliverIncomingPayloads  func(payloads [][]byte, codec dataCodec, packetHeaderSize int)
 	deliverIncomingBuffers   func(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int)
-	incomingPacketHeadroom   int
+	incomingPacketHeadroom   func() int
 	sessionTerminated        func(err error)
 	logDroppedIncomingPacket func(err error)
 }
@@ -126,7 +126,7 @@ func (s *tlsPeerSession) handleIncomingDataPackets(packets []*proto.Packet) {
 		if readCounterObserver != nil {
 			readCounterObserver(packet.KeyID, accountedBytes)
 		}
-		packetID, decodedPayload, err := receiveCodec.DecodeBuffer(aadPrefix, packet.Payload, s.hooks.incomingPacketHeadroom)
+		packetID, decodedPayload, err := receiveCodec.DecodeBuffer(aadPrefix, packet.Payload, s.hooks.incomingPacketHeadroom())
 		if err != nil {
 			if s.hooks.logDroppedIncomingPacket != nil {
 				s.hooks.logDroppedIncomingPacket(err)
@@ -674,4 +674,28 @@ func dataTransportHeaderSize(protocol string) int {
 		return 2
 	}
 	return 0
+}
+
+func (o ClientOptions) DataPacketHeadroom() (front int, rear int) {
+	if o.Mode == ModeStaticKey {
+		return 0, 0
+	}
+	protocol := o.Transport.Protocol
+	for _, remote := range o.Transport.Remotes {
+		if strings.HasPrefix(remote.Protocol, "tcp") {
+			protocol = remote.Protocol
+		}
+	}
+	return tlsDataPacketHeadroom(protocol)
+}
+
+func (o ServerOptions) DataPacketHeadroom() (front int, rear int) {
+	if o.Mode == ModeStaticKey {
+		return 0, 0
+	}
+	return tlsDataPacketHeadroom(o.Transport.Protocol)
+}
+
+func tlsDataPacketHeadroom(protocol string) (int, int) {
+	return dataTransportHeaderSize(protocol) + 4 + 4 + tlsDataAEADTagSize, tlsDataAEADTagSize
 }

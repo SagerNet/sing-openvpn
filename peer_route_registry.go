@@ -7,8 +7,8 @@ import (
 )
 
 type peerRoute struct {
-	peerAddress string
-	session     *tlsPeerSession
+	session *tlsPeerSession
+	queue   OutboundQueue
 }
 
 type peerRouteRegistry struct {
@@ -33,15 +33,15 @@ func newPeerRouteRegistry() *peerRouteRegistry {
 	}
 }
 
-func (r *peerRouteRegistry) Register(address netip.Addr, peerAddress string, session *tlsPeerSession) {
-	if !address.IsValid() || peerAddress == "" {
+func (r *peerRouteRegistry) Register(address netip.Addr, session *tlsPeerSession, queue OutboundQueue) {
+	if !address.IsValid() {
 		return
 	}
 	r.access.Lock()
 	defer r.access.Unlock()
 	r.routes[address] = peerRoute{
-		peerAddress: peerAddress,
-		session:     session,
+		session: session,
+		queue:   queue,
 	}
 }
 
@@ -52,6 +52,12 @@ func (r *peerRouteRegistry) Unregister(address netip.Addr) {
 	r.access.Lock()
 	defer r.access.Unlock()
 	delete(r.routes, address)
+}
+
+func (r *peerRouteRegistry) Lookup(destination netip.Addr) peerRoute {
+	r.access.RLock()
+	defer r.access.RUnlock()
+	return r.routes[destination]
 }
 
 func (r *peerRouteRegistry) LookupPackets(ipPackets [][]byte) []peerRouteLookup {

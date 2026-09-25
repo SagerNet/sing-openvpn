@@ -51,6 +51,9 @@ func NewClient(options ClientOptions) (*Client, error) {
 	if options.Context == nil {
 		options.Context = context.Background()
 	}
+	if options.IncomingPacketHeadroom == nil {
+		options.IncomingPacketHeadroom = func() int { return 0 }
+	}
 	remotes, err := resolveClientRemotes(&options)
 	if err != nil {
 		return nil, err

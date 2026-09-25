@@ -19,9 +19,10 @@ func TestTLSClientInitiatedRenegotiationKeepsDataFlowing(t *testing.T) {
 	serverContext, cancelServerContext := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancelServerContext()
 	server, err := NewServer(ServerOptions{
-		Context:   serverContext,
-		Mode:      ModeTLS,
-		Transport: ServerTransportOptions{ListenAddress: listenAddress, Protocol: "udp"},
+		NewOutboundQueue: newTestOutboundQueue,
+		Context:          serverContext,
+		Mode:             ModeTLS,
+		Transport:        ServerTransportOptions{ListenAddress: listenAddress, Protocol: "udp"},
 		TLS: ServerTLSOptions{
 			CertificateAuthority: Material{Path: filepath.Join("testdata", "openvpn", "pki", "ca.crt")},
 			Certificate:          Material{Path: filepath.Join("testdata", "openvpn", "pki", "server.crt")},

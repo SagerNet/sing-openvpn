@@ -708,6 +708,7 @@ func runTLSRealClientToRepoServerScenario(t *testing.T, env interopEnvironment, 
 		serverOptions.TLS.CryptV2 = openvpn.Material{Path: filepath.Join("testdata", "openvpn", "pki", "tls-crypt-v2-server.key")}
 		serverOptions.TLS.CryptV2ForceCookie = scenario.TLSCryptV2ForceCookie
 	}
+	serverOptions.NewOutboundQueue = newTestOutboundQueue
 	server, err := openvpn.NewServer(serverOptions)
 	if err != nil {
 		t.Fatalf("create server: %v", err)

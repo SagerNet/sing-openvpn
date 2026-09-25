@@ -18,9 +18,10 @@ func TestTLSServerRejectsUnownedTunnelSources(t *testing.T) {
 	serverContext, cancelServerContext := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancelServerContext()
 	server, err := NewServer(ServerOptions{
-		Context:   serverContext,
-		Mode:      ModeTLS,
-		Transport: ServerTransportOptions{ListenAddress: listenAddress, Protocol: "tcp"},
+		NewOutboundQueue: newTestOutboundQueue,
+		Context:          serverContext,
+		Mode:             ModeTLS,
+		Transport:        ServerTransportOptions{ListenAddress: listenAddress, Protocol: "tcp"},
 		TLS: ServerTLSOptions{
 			CertificateAuthority: Material{Path: filepath.Join("testdata", "openvpn", "pki", "ca.crt")},
 			Certificate:          Material{Path: filepath.Join("testdata", "openvpn", "pki", "server.crt")},
