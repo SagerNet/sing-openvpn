@@ -48,8 +48,9 @@ func TestOpenVPNInteropUDPFloatOntoAddressHeldByStaleSessionKeepsFloatedPeerConn
 	serverContext, cancelServer := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancelServer()
 	server, err := openvpn.NewServer(openvpn.ServerOptions{
-		Context: serverContext,
-		Mode:    openvpn.ModeTLS,
+		NewOutboundQueue: newTestOutboundQueue,
+		Context:          serverContext,
+		Mode:             openvpn.ModeTLS,
 		Transport: openvpn.ServerTransportOptions{
 			PacketConn: serverListener,
 			Protocol:   "udp4",

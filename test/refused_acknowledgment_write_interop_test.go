@@ -120,8 +120,9 @@ func TestOpenVPNInteropRefusedAcknowledgmentWriteAcknowledgesReceivedControlPack
 	serverContext, cancelServer := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancelServer()
 	server, err := openvpn.NewServer(openvpn.ServerOptions{
-		Context: serverContext,
-		Mode:    openvpn.ModeTLS,
+		NewOutboundQueue: newTestOutboundQueue,
+		Context:          serverContext,
+		Mode:             openvpn.ModeTLS,
 		Transport: openvpn.ServerTransportOptions{
 			PacketConn: refusingListener,
 			Protocol:   "udp4",

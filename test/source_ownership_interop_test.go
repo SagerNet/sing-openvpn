@@ -28,8 +28,9 @@ func TestOpenVPNInteropServerWithoutAddressPoolForwardsPeerTraffic(t *testing.T)
 	serverContext, cancelServer := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancelServer()
 	server, err := openvpn.NewServer(openvpn.ServerOptions{
-		Context: serverContext,
-		Mode:    openvpn.ModeTLS,
+		NewOutboundQueue: newTestOutboundQueue,
+		Context:          serverContext,
+		Mode:             openvpn.ModeTLS,
 		Transport: openvpn.ServerTransportOptions{
 			ListenAddress: fmt.Sprintf("0.0.0.0:%d", listenPort),
 			Protocol:      "udp4",

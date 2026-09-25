@@ -348,8 +348,9 @@ func runClientCertificateModeSession(t *testing.T, material certificateVerificat
 		serverTLS.CertificateAuthority = material.certificateAuthority
 	}
 	server, err := openvpn.NewServer(openvpn.ServerOptions{
-		Context: context.Background(),
-		Mode:    openvpn.ModeTLS,
+		NewOutboundQueue: newTestOutboundQueue,
+		Context:          context.Background(),
+		Mode:             openvpn.ModeTLS,
 		Transport: openvpn.ServerTransportOptions{
 			ListenAddress: listenAddress,
 			Protocol:      "udp",
@@ -401,8 +402,9 @@ func runCertificateVerificationSession(t *testing.T, material certificateVerific
 	serverTLS.Certificate = material.serverCertificate
 	serverTLS.Key = material.serverKey
 	server, err := openvpn.NewServer(openvpn.ServerOptions{
-		Context: context.Background(),
-		Mode:    openvpn.ModeTLS,
+		NewOutboundQueue: newTestOutboundQueue,
+		Context:          context.Background(),
+		Mode:             openvpn.ModeTLS,
 		Transport: openvpn.ServerTransportOptions{
 			ListenAddress: listenAddress,
 			Protocol:      "udp",

@@ -210,7 +210,7 @@ func (c *Client) decodeIncomingDataFramingBuffer(payload *buf.Buffer) (*buf.Buff
 	if err != nil || !complete {
 		return nil, complete, err
 	}
-	return newDataPacketBuffer(c.options.DataChannel.PacketHeadroom, decodedBytes), true, nil
+	return newDataPacketBuffer(c.options.IncomingPacketHeadroom(), decodedBytes), true, nil
 }
 
 func (c *Client) handleIncomingDataPayloads(payloads [][]byte, codec dataCodec, packetHeaderSize int, outerTransportOverhead int) {
@@ -271,7 +271,7 @@ func (c *Client) pushIncomingDataPackets(packets [][]byte) {
 		if len(packet) == 0 {
 			continue
 		}
-		packetBuffers = append(packetBuffers, newDataPacketBuffer(c.options.DataChannel.PacketHeadroom, packet))
+		packetBuffers = append(packetBuffers, newDataPacketBuffer(c.options.IncomingPacketHeadroom(), packet))
 	}
 	dropped := c.dataPlane.incomingDataPackets.PushBatch(packetBuffers, func(packetBuffer *buf.Buffer) {
 		packetBuffer.Release()

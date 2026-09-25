@@ -5,6 +5,7 @@ import (
 	"context"
 	"net/netip"
 
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 )
 
@@ -100,21 +101,27 @@ func (s *Server) WriteDataPackets(peerAddress string, packets [][]byte) error {
 	if err != nil {
 		return err
 	}
-	return s.writeDataPackets(peerAddress, packets)
+	var queue OutboundQueue
+	if s.static != nil {
+		queue, err = s.static.peerOutboundQueue(peerAddress)
+	} else {
+		queue, err = s.tls.peerOutboundQueue(peerAddress)
+	}
+	if err != nil {
+		return err
+	}
+	queue.WriteBuffers(s.newOutgoingDataBuffers(packets))
+	return nil
 }
 
-func (s *Server) writeDataPackets(peerAddress string, packets [][]byte) error {
-	if s.static != nil {
-		return s.static.WriteDataPackets(peerAddress, packets)
-	}
-	return s.tls.WriteDataPackets(peerAddress, packets)
-}
-
-func (s *Server) writeDataPacketBuffers(peerAddress string, packetBuffers []*buf.Buffer) error {
-	if s.static != nil {
-		return s.static.WriteDataPacketBuffers(peerAddress, packetBuffers)
-	}
-	return s.tls.WriteDataPacketBuffers(peerAddress, packetBuffers)
+func (s *Server) newOutgoingDataBuffers(packets [][]byte) []*buf.Buffer {
+	frontHeadroom, rearHeadroom := s.options.DataPacketHeadroom()
+	return common.Map(packets, func(packet []byte) *buf.Buffer {
+		packetBuffer := buf.NewSize(frontHeadroom + len(packet) + rearHeadroom)
+		packetBuffer.Resize(frontHeadroom, 0)
+		common.Must1(packetBuffer.Write(packet))
+		return packetBuffer
+	})
 }
 
 func (s *Server) WriteDataPacketByDestination(packet []byte) error {
@@ -129,58 +136,7 @@ func (s *Server) WriteDataPacketByDestination(packet []byte) error {
 }
 
 func (s *Server) WriteDataPacketsByDestination(packets [][]byte) ([]*RouteMissError, error) {
-	if len(packets) == 0 {
-		return nil, nil
-	}
-	err := s.requireRunning()
-	if err != nil {
-		return nil, err
-	}
-	var routeMisses []*RouteMissError
-	routeLookups := s.routes.LookupPackets(packets)
-	var currentRoute peerRoute
-	currentPackets := make([][]byte, 0, len(packets))
-	flushCurrentBatch := func() error {
-		if len(currentPackets) == 0 {
-			return nil
-		}
-		var writeErr error
-		if currentRoute.session != nil {
-			writeErr = currentRoute.session.WriteDataPackets(currentPackets)
-		} else {
-			writeErr = s.writeDataPackets(currentRoute.peerAddress, currentPackets)
-		}
-		currentPackets = currentPackets[:0]
-		return writeErr
-	}
-	for i, packet := range packets {
-		route := routeLookups[i].route
-		if !routeLookups[i].found {
-			err = flushCurrentBatch()
-			if err != nil {
-				return routeMisses, err
-			}
-			packetRouteErr := newRouteMissError(routeLookups[i].destination, packet)
-			routeMiss, isRouteMiss := packetRouteErr.(*RouteMissError)
-			if !isRouteMiss {
-				return routeMisses, packetRouteErr
-			}
-			routeMisses = append(routeMisses, routeMiss)
-			continue
-		}
-		if len(currentPackets) > 0 && route != currentRoute {
-			err = flushCurrentBatch()
-			if err != nil {
-				return routeMisses, err
-			}
-		}
-		if len(currentPackets) == 0 {
-			currentRoute = route
-		}
-		currentPackets = append(currentPackets, packet)
-	}
-	err = flushCurrentBatch()
-	return routeMisses, err
+	return s.WriteDataPacketBuffersByDestination(s.newOutgoingDataBuffers(packets))
 }
 
 func (s *Server) WriteDataPacketBuffersByDestination(packetBuffers []*buf.Buffer) ([]*RouteMissError, error) {
@@ -192,71 +148,38 @@ func (s *Server) WriteDataPacketBuffersByDestination(packetBuffers []*buf.Buffer
 		buf.ReleaseMulti(packetBuffers)
 		return nil, err
 	}
-	packets := make([][]byte, len(packetBuffers))
+	routeLookups := s.routes.LookupPackets(common.Map(packetBuffers, (*buf.Buffer).Bytes))
+	var (
+		routeMisses  []*RouteMissError
+		invalidErr   error
+		currentQueue OutboundQueue
+	)
+	currentBatch := make([]*buf.Buffer, 0, len(packetBuffers))
 	for i, packetBuffer := range packetBuffers {
-		packets[i] = packetBuffer.Bytes()
-	}
-	var routeMisses []*RouteMissError
-	routeLookups := s.routes.LookupPackets(packets)
-	var currentRoute peerRoute
-	currentPacketBuffers := make([]*buf.Buffer, 0, len(packetBuffers))
-	flushCurrentBatch := func() error {
-		if len(currentPacketBuffers) == 0 {
-			return nil
-		}
-		var writeErr error
-		if currentRoute.session != nil {
-			writeErr = currentRoute.session.WriteDataPacketBuffers(currentPacketBuffers)
-		} else {
-			writeErr = s.writeDataPacketBuffers(currentRoute.peerAddress, currentPacketBuffers)
-		}
-		currentPacketBuffers = nil
-		return writeErr
-	}
-	for i, packetBuffer := range packetBuffers {
-		route := routeLookups[i].route
-		if !routeLookups[i].found {
-			err = flushCurrentBatch()
-			if err != nil {
-				packetBuffer.Release()
-				buf.ReleaseMulti(packetBuffers[i+1:])
-				return routeMisses, err
+		routeLookup := routeLookups[i]
+		if !routeLookup.found {
+			if routeLookup.destination.IsValid() {
+				routeMisses = append(routeMisses, &RouteMissError{
+					Destination: routeLookup.destination,
+					Packet:      bytes.Clone(packetBuffer.Bytes()),
+				})
+			} else {
+				invalidErr = ErrInvalidIPPacket
 			}
-			packetRouteErr := newRouteMissError(routeLookups[i].destination, packetBuffer.Bytes())
 			packetBuffer.Release()
-			routeMiss, isRouteMiss := packetRouteErr.(*RouteMissError)
-			if !isRouteMiss {
-				buf.ReleaseMulti(packetBuffers[i+1:])
-				return routeMisses, packetRouteErr
-			}
-			routeMisses = append(routeMisses, routeMiss)
 			continue
 		}
-		if len(currentPacketBuffers) > 0 && route != currentRoute {
-			err = flushCurrentBatch()
-			if err != nil {
-				packetBuffer.Release()
-				buf.ReleaseMulti(packetBuffers[i+1:])
-				return routeMisses, err
-			}
+		if len(currentBatch) > 0 && routeLookup.route.queue != currentQueue {
+			currentQueue.WriteBuffers(currentBatch)
+			currentBatch = currentBatch[:0]
 		}
-		if len(currentPacketBuffers) == 0 {
-			currentRoute = route
-		}
-		currentPacketBuffers = append(currentPacketBuffers, packetBuffer)
+		currentQueue = routeLookup.route.queue
+		currentBatch = append(currentBatch, packetBuffer)
 	}
-	err = flushCurrentBatch()
-	return routeMisses, err
-}
-
-func newRouteMissError(destination netip.Addr, packet []byte) error {
-	if !destination.IsValid() {
-		return ErrInvalidIPPacket
+	if len(currentBatch) > 0 {
+		currentQueue.WriteBuffers(currentBatch)
 	}
-	return &RouteMissError{
-		Destination: destination,
-		Packet:      bytes.Clone(packet),
-	}
+	return routeMisses, invalidErr
 }
 
 func (s *Server) pushIncomingDataPackets(packets []ServerDataPacket) {
@@ -270,7 +193,7 @@ func (s *Server) pushIncomingDataPackets(packets []ServerDataPacket) {
 		}
 		packetBuffers = append(packetBuffers, ServerDataBuffer{
 			PeerAddress: packet.PeerAddress,
-			Buffer:      newDataPacketBuffer(s.options.DataChannel.PacketHeadroom, packet.Payload),
+			Buffer:      newDataPacketBuffer(s.options.IncomingPacketHeadroom(), packet.Payload),
 		})
 	}
 	dropped := s.incomingDataPackets.PushBatch(packetBuffers, func(packetBuffer ServerDataBuffer) {

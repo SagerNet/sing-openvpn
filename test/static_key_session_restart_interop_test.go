@@ -37,8 +37,9 @@ func TestOpenVPNInteropStaticKeyServerKeepsListeningAcrossSessionRestart(t *test
 	serverContext, cancelServer := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancelServer()
 	server, err := openvpn.NewServer(openvpn.ServerOptions{
-		Context: serverContext,
-		Mode:    openvpn.ModeStaticKey,
+		NewOutboundQueue: newTestOutboundQueue,
+		Context:          serverContext,
+		Mode:             openvpn.ModeStaticKey,
 		Transport: openvpn.ServerTransportOptions{
 			PacketConn:    serverListener,
 			RemoteAddress: relay.serverFacing.LocalAddr().String(),

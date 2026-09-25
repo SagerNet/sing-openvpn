@@ -37,12 +37,18 @@ func NewServer(options ServerOptions) (*Server, error) {
 	if options.Context == nil {
 		options.Context = context.Background()
 	}
+	if options.IncomingPacketHeadroom == nil {
+		options.IncomingPacketHeadroom = func() int { return 0 }
+	}
 	protocol, listenNetwork, err := resolveTransportProtocol(options.Transport.Protocol)
 	if err != nil {
 		return nil, err
 	}
 	if options.Transport.ListenAddress == "" && options.Transport.Listener == nil && options.Transport.PacketConn == nil {
 		return nil, ErrMissingListenAddress
+	}
+	if options.NewOutboundQueue == nil {
+		return nil, ErrMissingOutboundQueue
 	}
 	if options.Transport.ListenAddress == "" {
 		if options.Transport.Listener != nil {
