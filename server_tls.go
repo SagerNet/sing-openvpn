@@ -232,34 +232,36 @@ func (s *tlsServer) Close() error {
 	return closeErr
 }
 
-func (s *tlsServer) WriteDataPackets(peerAddress string, payloads [][]byte) error {
-	if len(payloads) == 0 {
-		return nil
-	}
-	if !s.isRunning() {
-		return ErrServerClosed
-	}
-	session := s.getSession(peerAddress)
+func (s *tlsServer) peerOutboundQueue(peerAddress string) (OutboundQueue, error) {
+	s.sessionAccess.RLock()
+	defer s.sessionAccess.RUnlock()
+	session := s.sessionByPeer[peerAddress]
 	if session == nil {
-		return ErrPeerNotFound
+		return nil, ErrPeerNotFound
 	}
-	return session.WriteDataPackets(payloads)
+	if session.outboundQueue == nil {
+		return nil, ErrDataChannelNotReady
+	}
+	return session.outboundQueue, nil
 }
 
-func (s *tlsServer) WriteDataPacketBuffers(peerAddress string, payloads []*buf.Buffer) error {
-	if len(payloads) == 0 {
-		return nil
+func (s *tlsServer) startOutboundQueue(session *tlsServerSession) {
+	queue := s.parent.options.NewOutboundQueue(func(buffers []*buf.Buffer) {
+		_ = session.WriteDataPacketBuffers(buffers)
+	})
+	s.sessionAccess.Lock()
+	session.outboundQueue = queue
+	s.sessionAccess.Unlock()
+}
+
+func (s *tlsServer) closeOutboundQueue(session *tlsServerSession) {
+	s.sessionAccess.Lock()
+	queue := session.outboundQueue
+	session.outboundQueue = nil
+	s.sessionAccess.Unlock()
+	if queue != nil {
+		_ = queue.Close()
 	}
-	if !s.isRunning() {
-		buf.ReleaseMulti(payloads)
-		return ErrServerClosed
-	}
-	session := s.getSession(peerAddress)
-	if session == nil {
-		buf.ReleaseMulti(payloads)
-		return ErrPeerNotFound
-	}
-	return session.WriteDataPacketBuffers(payloads)
 }
 
 func (s *tlsServer) isRunning() bool {
@@ -276,12 +278,6 @@ func (s *tlsServer) reserveLoopWorker() bool {
 	}
 	s.loopWaitGroup.Add(1)
 	return true
-}
-
-func (s *tlsServer) getSession(peerAddress string) *tlsServerSession {
-	s.sessionAccess.Lock()
-	defer s.sessionAccess.Unlock()
-	return s.sessionByPeer[peerAddress]
 }
 
 func (s *tlsServer) registerSession(initialPeerAddress string, session *tlsServerSession, udpAddress net.Addr) error {

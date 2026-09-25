@@ -61,8 +61,9 @@ func runMSSFixDataPathSession(t *testing.T, protocol string, cipher string, mssF
 		serverDataChannel.MSSFixDisabled = true
 	}
 	server, err := openvpn.NewServer(openvpn.ServerOptions{
-		Context: context.Background(),
-		Mode:    openvpn.ModeTLS,
+		NewOutboundQueue: newTestOutboundQueue,
+		Context:          context.Background(),
+		Mode:             openvpn.ModeTLS,
 		Transport: openvpn.ServerTransportOptions{
 			ListenAddress: listenAddress,
 			Protocol:      protocol,

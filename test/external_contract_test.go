@@ -20,10 +20,12 @@ func TestTLSLoopbackDataPlaneRoutesByDestination(t *testing.T) {
 	serverContext, cancelServerContext := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancelServerContext()
 	server, err := NewServer(ServerOptions{
-		Context:     serverContext,
-		Mode:        ModeTLS,
-		Transport:   ServerTransportOptions{ListenAddress: listenAddress, Protocol: "tcp"},
-		DataChannel: ServerDataChannelOptions{MTU: 1400, PacketHeadroom: 32},
+		NewOutboundQueue:       newTestOutboundQueue,
+		IncomingPacketHeadroom: func() int { return 32 },
+		Context:                serverContext,
+		Mode:                   ModeTLS,
+		Transport:              ServerTransportOptions{ListenAddress: listenAddress, Protocol: "tcp"},
+		DataChannel:            ServerDataChannelOptions{MTU: 1400},
 		TLS: ServerTLSOptions{
 			CertificateAuthority: Material{Content: localFixtureContent(t, "ca.crt")},
 			Certificate:          Material{Content: localFixtureContent(t, "server.crt")},
@@ -52,10 +54,10 @@ func TestTLSLoopbackDataPlaneRoutesByDestination(t *testing.T) {
 	clientContext, cancelClientContext := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancelClientContext()
 	client, err := NewClient(ClientOptions{
-		Context:     clientContext,
-		Mode:        ModeTLS,
-		Transport:   clientTransportOptions(t, listenAddress, "tcp"),
-		DataChannel: ClientDataChannelOptions{PacketHeadroom: 32},
+		Context:                clientContext,
+		Mode:                   ModeTLS,
+		Transport:              clientTransportOptions(t, listenAddress, "tcp"),
+		IncomingPacketHeadroom: func() int { return 32 },
 		TLS: ClientTLSOptions{
 			CertificateAuthority: Material{Content: localFixtureContent(t, "ca.crt")},
 			Certificate:          Material{Content: localFixtureContent(t, "client.crt")},
@@ -162,9 +164,10 @@ func TestTLSLoopbackPushDNSEmitsDHCPOptionAndPromotesTypedDNS(t *testing.T) {
 	serverContext, cancelServerContext := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancelServerContext()
 	server, err := NewServer(ServerOptions{
-		Context:   serverContext,
-		Mode:      ModeTLS,
-		Transport: ServerTransportOptions{ListenAddress: listenAddress, Protocol: "tcp"},
+		NewOutboundQueue: newTestOutboundQueue,
+		Context:          serverContext,
+		Mode:             ModeTLS,
+		Transport:        ServerTransportOptions{ListenAddress: listenAddress, Protocol: "tcp"},
 		TLS: ServerTLSOptions{
 			CertificateAuthority: Material{Content: localFixtureContent(t, "ca.crt")},
 			Certificate:          Material{Content: localFixtureContent(t, "server.crt")},
@@ -252,9 +255,10 @@ func TestServerUDPTransportInjectionAndAuthenticator(t *testing.T) {
 	defer packetConn.Close()
 	authCalls := make(chan [2]string, 1)
 	server, err := NewServer(ServerOptions{
-		Context:   context.Background(),
-		Mode:      ModeTLS,
-		Transport: ServerTransportOptions{PacketConn: packetConn, Protocol: "udp"},
+		NewOutboundQueue: newTestOutboundQueue,
+		Context:          context.Background(),
+		Mode:             ModeTLS,
+		Transport:        ServerTransportOptions{PacketConn: packetConn, Protocol: "udp"},
 		TLS: ServerTLSOptions{
 			CertificateAuthority: Material{Content: localFixtureContent(t, "ca.crt")},
 			Certificate:          Material{Content: localFixtureContent(t, "server.crt")},

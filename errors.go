@@ -5,6 +5,7 @@ import E "github.com/sagernet/sing/common/exceptions"
 var (
 	ErrMissingServer               = E.New("missing openvpn server")
 	ErrMissingListenAddress        = E.New("missing openvpn listen address")
+	ErrMissingOutboundQueue        = E.New("missing openvpn outbound queue")
 	ErrUnsupportedProtocol         = E.New("unsupported openvpn protocol")
 	ErrUnsupportedMode             = E.New("unsupported openvpn mode")
 	ErrHandshakeTimeout            = E.New("control handshake timeout")

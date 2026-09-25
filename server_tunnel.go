@@ -18,7 +18,7 @@ func (s *tlsServerSession) allocateAndRegisterTunnelAddress() error {
 		}
 		s.ifconfigInet4 = lease.Client
 		s.ifconfigPeer4 = lease.Peer
-		parent.routes.Register(lease.Client, s.peerAddress, s.tlsPeerSession)
+		parent.routes.Register(lease.Client, s.tlsPeerSession, s.outboundQueue)
 	}
 	if parent.ipPool.HasIPv6() && !s.ifconfigInet6.IsValid() {
 		address, err := parent.ipPool.AllocateIPv6ForIdentity(stickyIdentity)
@@ -26,12 +26,12 @@ func (s *tlsServerSession) allocateAndRegisterTunnelAddress() error {
 			return err
 		}
 		s.ifconfigInet6 = address
-		parent.routes.Register(address, s.peerAddress, s.tlsPeerSession)
+		parent.routes.Register(address, s.tlsPeerSession, s.outboundQueue)
 	}
 	return nil
 }
 
-func (s *tlsServerSession) releaseTunnelAddress() {
+func (s *tlsServerSession) releaseDataPlane() {
 	parent := s.server.parent
 	if s.ifconfigInet4.IsValid() {
 		parent.routes.Unregister(s.ifconfigInet4)
@@ -44,6 +44,7 @@ func (s *tlsServerSession) releaseTunnelAddress() {
 		parent.ipPool.Release(s.ifconfigInet6)
 		s.ifconfigInet6 = netip.Addr{}
 	}
+	s.server.closeOutboundQueue(s)
 }
 
 // helper.c expands --server into the pool plus a "topology" push entry, so the

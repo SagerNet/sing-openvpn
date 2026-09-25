@@ -249,6 +249,7 @@ func runLoopbackScenario(t *testing.T, scenario loopbackScenario) {
 			serverOptions.TLS.Key = Material{Path: filepath.Join("testdata", "openvpn", "pki", "server.key")}
 		}
 	}
+	serverOptions.NewOutboundQueue = newTestOutboundQueue
 	server, err := NewServer(serverOptions)
 	if err != nil {
 		t.Fatal(err)

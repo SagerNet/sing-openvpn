@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 )
@@ -83,7 +84,6 @@ type ClientDataChannelOptions struct {
 	AllowCompression string
 	ReplayWindow     uint32
 	ReplayWindowTime time.Duration
-	PacketHeadroom   int
 }
 
 type ClientTLSOptions struct {
@@ -152,19 +152,20 @@ type ClientTimingOptions struct {
 }
 
 type ClientOptions struct {
-	Context               context.Context
-	Mode                  string
-	Transport             ClientTransportOptions
-	DataChannel           ClientDataChannelOptions
-	TLS                   ClientTLSOptions
-	Authentication        ClientAuthenticationOptions
-	Pull                  ClientPullOptions
-	Tunnel                ClientTunnelOptions
-	Timing                ClientTimingOptions
-	StaticKey             Material
-	KeyDirection          int
-	OnTunnelConfiguration func(event TunnelConfigurationEvent) error
-	Logger                logger.ContextLogger
+	Context                context.Context
+	Mode                   string
+	Transport              ClientTransportOptions
+	DataChannel            ClientDataChannelOptions
+	TLS                    ClientTLSOptions
+	Authentication         ClientAuthenticationOptions
+	Pull                   ClientPullOptions
+	Tunnel                 ClientTunnelOptions
+	Timing                 ClientTimingOptions
+	StaticKey              Material
+	KeyDirection           int
+	OnTunnelConfiguration  func(event TunnelConfigurationEvent) error
+	IncomingPacketHeadroom func() int
+	Logger                 logger.ContextLogger
 }
 
 type ServerTransportOptions struct {
@@ -194,7 +195,6 @@ type ServerDataChannelOptions struct {
 	Auth             string
 	ReplayWindow     uint32
 	ReplayWindowTime time.Duration
-	PacketHeadroom   int
 }
 
 type ServerTLSOptions struct {
@@ -260,19 +260,21 @@ type ServerPushOptions struct {
 }
 
 type ServerOptions struct {
-	Context        context.Context
-	Mode           string
-	Transport      ServerTransportOptions
-	Resources      ServerResourceOptions
-	DataChannel    ServerDataChannelOptions
-	TLS            ServerTLSOptions
-	Authentication ServerAuthenticationOptions
-	Timing         ServerTimingOptions
-	Tunnel         ServerTunnelOptions
-	Push           ServerPushOptions
-	StaticKey      Material
-	KeyDirection   int
-	Logger         logger.ContextLogger
+	Context                context.Context
+	Mode                   string
+	Transport              ServerTransportOptions
+	Resources              ServerResourceOptions
+	DataChannel            ServerDataChannelOptions
+	TLS                    ServerTLSOptions
+	Authentication         ServerAuthenticationOptions
+	Timing                 ServerTimingOptions
+	Tunnel                 ServerTunnelOptions
+	Push                   ServerPushOptions
+	StaticKey              Material
+	KeyDirection           int
+	Logger                 logger.ContextLogger
+	NewOutboundQueue       func(write func(buffers []*buf.Buffer)) OutboundQueue
+	IncomingPacketHeadroom func() int
 }
 
 type TunnelConfiguration struct {

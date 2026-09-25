@@ -150,8 +150,9 @@ func assertClientCRLRejectsHandshake(t *testing.T, material crlHandshakeMaterial
 	listenAddress := reserveListenAddressForProtocol(t, "udp")
 	authenticatorCalled := make(chan struct{}, 1)
 	server, err := NewServer(ServerOptions{
-		Context: context.Background(),
-		Mode:    ModeTLS,
+		NewOutboundQueue: newTestOutboundQueue,
+		Context:          context.Background(),
+		Mode:             ModeTLS,
 		Transport: ServerTransportOptions{
 			ListenAddress: listenAddress,
 			Protocol:      "udp",
@@ -224,8 +225,9 @@ func assertClientCRLAcceptsHandshake(t *testing.T, material crlHandshakeMaterial
 	listenAddress := reserveListenAddressForProtocol(t, "udp")
 	authenticatorCalled := make(chan struct{}, 1)
 	server, err := NewServer(ServerOptions{
-		Context: context.Background(),
-		Mode:    ModeTLS,
+		NewOutboundQueue: newTestOutboundQueue,
+		Context:          context.Background(),
+		Mode:             ModeTLS,
 		Transport: ServerTransportOptions{
 			ListenAddress: listenAddress,
 			Protocol:      "udp",

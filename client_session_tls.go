@@ -121,7 +121,7 @@ func newTLSClient(parent *Client, useActiveAuthToken bool, remote clientRemote) 
 		deliverIncomingBuffers: func(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int) {
 			client.parent.handleIncomingDataBuffers(payloads, codec, packetHeaderSize, client.mssFixOuterTransportOverhead())
 		},
-		incomingPacketHeadroom:   client.parent.options.DataChannel.PacketHeadroom,
+		incomingPacketHeadroom:   client.parent.options.IncomingPacketHeadroom,
 		sessionTerminated:        client.finish,
 		logDroppedIncomingPacket: client.parent.dataPlane.incomingPacketDropLog.Log,
 	}
