@@ -9,6 +9,7 @@ import (
 type peerRoute struct {
 	peerAddress string
 	session     *tlsPeerSession
+	identity    PeerIdentity
 }
 
 type peerRouteRegistry struct {
@@ -33,7 +34,7 @@ func newPeerRouteRegistry() *peerRouteRegistry {
 	}
 }
 
-func (r *peerRouteRegistry) Register(address netip.Addr, peerAddress string, session *tlsPeerSession) {
+func (r *peerRouteRegistry) Register(address netip.Addr, peerAddress string, session *tlsPeerSession, identity PeerIdentity) {
 	if !address.IsValid() || peerAddress == "" {
 		return
 	}
@@ -42,7 +43,18 @@ func (r *peerRouteRegistry) Register(address netip.Addr, peerAddress string, ses
 	r.routes[address] = peerRoute{
 		peerAddress: peerAddress,
 		session:     session,
+		identity:    identity,
 	}
+}
+
+func (r *peerRouteRegistry) LookupIdentity(address netip.Addr) (PeerIdentity, bool) {
+	r.access.RLock()
+	defer r.access.RUnlock()
+	route, found := r.routes[address]
+	if !found || route.session == nil {
+		return PeerIdentity{}, false
+	}
+	return route.identity, true
 }
 
 func (r *peerRouteRegistry) Unregister(address netip.Addr) {

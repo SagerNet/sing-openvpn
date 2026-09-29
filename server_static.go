@@ -177,10 +177,10 @@ func (s *staticKeyServer) setPeerAddress(peerAddress string) {
 	s.peerAddress = peerAddress
 	s.access.Unlock()
 	if s.parent.options.Tunnel.VPNGateway.IsValid() {
-		s.parent.routes.Register(s.parent.options.Tunnel.VPNGateway, peerAddress, nil)
+		s.parent.routes.Register(s.parent.options.Tunnel.VPNGateway, peerAddress, nil, PeerIdentity{})
 	}
 	if s.parent.options.Tunnel.VPNGatewayIPv6.IsValid() {
-		s.parent.routes.Register(s.parent.options.Tunnel.VPNGatewayIPv6, peerAddress, nil)
+		s.parent.routes.Register(s.parent.options.Tunnel.VPNGatewayIPv6, peerAddress, nil, PeerIdentity{})
 	}
 }
 
