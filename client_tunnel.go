@@ -171,7 +171,19 @@ func (c *Client) applyPushedOptions(options pushedOptions) pushedOptionsApplyRes
 		updatedConfiguration.VPNGatewayIPv6 = vpnGatewayIPv6
 	}
 	if options.TunMTU > 0 {
-		updatedConfiguration.TunMTU = options.TunMTU
+		minimumTunMTU := uint32(576)
+		if len(updatedConfiguration.LocalIPv6) > 0 {
+			minimumTunMTU = 1280
+		}
+		if options.TunMTU < minimumTunMTU {
+			parseErrors = append(parseErrors, pushedOptionParseError{
+				Name:  "tun-mtu",
+				Value: strconv.FormatUint(uint64(options.TunMTU), 10),
+				Err:   E.New("tun-mtu must be at least ", minimumTunMTU),
+			})
+		} else {
+			updatedConfiguration.TunMTU = options.TunMTU
+		}
 	}
 	if !c.options.Pull.RouteNoPull {
 		if options.modernDNS && !c.tunnel.modernDNSConfigured {
