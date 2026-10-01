@@ -124,6 +124,10 @@ func NewClient(options ClientOptions) (*Client, error) {
 			options.Timing.RenegotiationInterval = defaultRenegotiationInterval
 		}
 	}
+	err = preparePushPeerInfoIdentities(&options)
+	if err != nil {
+		return nil, err
+	}
 	client := &Client{
 		options: options,
 		mode:    mode,
@@ -153,6 +157,16 @@ func NewClient(options ClientOptions) (*Client, error) {
 	client.dataPlane.outgoingPacketDropLog.logger = options.Logger
 	client.dataPlane.outgoingPacketDropLog.ctx = options.Context
 	return client, nil
+}
+
+// PeerUUID returns the UV_UUID advertised when PushPeerInfo is enabled.
+func (c *Client) PeerUUID() string {
+	return c.options.PeerUUID
+}
+
+// HardwareAddress returns the IV_HWADDR advertised when PushPeerInfo is enabled.
+func (c *Client) HardwareAddress() string {
+	return c.options.HardwareAddress
 }
 
 func (c *Client) Start() error {

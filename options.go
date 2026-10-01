@@ -163,6 +163,16 @@ type ClientOptions struct {
 	Timing                ClientTimingOptions
 	StaticKey             Material
 	KeyDirection          int
+	// PushPeerInfo enables OpenVPN --push-peer-info identity fields in the
+	// TLS key-method peer-info payload (IV_HWADDR and UV_UUID).
+	PushPeerInfo bool
+	// PeerUUID is the UV_UUID value sent when PushPeerInfo is enabled. When
+	// empty, NewClient generates a random UUID v4 and stores it here so the
+	// caller can persist it across restarts.
+	PeerUUID string
+	// HardwareAddress is the IV_HWADDR value sent when PushPeerInfo is
+	// enabled. When empty, NewClient best-effort fills it from a local MAC.
+	HardwareAddress       string
 	OnTunnelConfiguration func(event TunnelConfigurationEvent) error
 	Logger                logger.ContextLogger
 }
