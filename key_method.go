@@ -171,6 +171,7 @@ func buildTLSPeerInfo(options ClientOptions, requestPush bool) string {
 	builder.WriteString("IV_COMP_STUBv2=1\n")
 	// Upstream key_method_2_write always emits IV_TCPNL=1.
 	builder.WriteString("IV_TCPNL=1\n")
+	appendPushPeerInfoIdentities(&builder, options)
 	return builder.String()
 }
 
