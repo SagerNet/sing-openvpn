@@ -530,7 +530,7 @@ func verifyAgainstCRL(chain []*x509.Certificate, crlPath string) error {
 	}
 	revocationLists, err := loadRevocationLists(crlPath)
 	if err != nil {
-		return err
+		return E.Errors(errClientSessionConfiguration, E.Cause(err, "load CRL"))
 	}
 	if len(chain) == 0 {
 		return ErrCRLUnavailable

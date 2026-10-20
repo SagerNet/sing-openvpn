@@ -165,6 +165,11 @@ func (c *Client) Start() error {
 		c.lifecycle.access.Unlock()
 		return ErrClientClosed
 	}
+	err := c.checkSessionMaterial()
+	if err != nil {
+		c.lifecycle.access.Unlock()
+		return err
+	}
 	supervisorContext, cancelSupervisor := context.WithCancel(c.options.Context)
 	c.lifecycle.supervisorCancel = cancelSupervisor
 	c.lifecycle.supervisorDone = make(chan struct{})

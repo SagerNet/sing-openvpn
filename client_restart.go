@@ -1,6 +1,7 @@
 package openvpn
 
 import (
+	"errors"
 	"strings"
 
 	E "github.com/sagernet/sing/common/exceptions"
@@ -57,7 +58,7 @@ type clientConnectionCursor struct {
 
 func (c *Client) nextConnectionCursor(current clientConnectionCursor, sessionErr error, initialized bool) clientConnectionCursor {
 	advance := clientRemoteAdvanceNextAddress
-	if initialized {
+	if initialized || errors.Is(sessionErr, errClientSessionConfiguration) {
 		advance = clientRemoteAdvanceStay
 	}
 	if E.IsMulti(sessionErr, ErrRemoteAddressExhausted) {
