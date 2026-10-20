@@ -426,6 +426,13 @@ func validateInitialClientReset(packet *proto.Packet) error {
 
 func (s *tlsServerSession) runControlLoop() error {
 	for {
+		// A retired or unavailable primary stream may keep timing out after
+		// Close. End this peer's loop without waiting for the whole listener.
+		select {
+		case <-s.sessionContext.Done():
+			return s.sessionContext.Err()
+		default:
+		}
 		controlRecord, err := s.readControlChannelRecord(time.Now().Add(time.Second))
 		if err != nil {
 			if E.IsTimeout(err) {
