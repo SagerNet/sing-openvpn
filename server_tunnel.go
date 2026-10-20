@@ -11,6 +11,7 @@ func (s *tlsServerSession) allocateAndRegisterTunnelAddress() error {
 	if !parent.options.Authentication.DuplicateCN {
 		stickyIdentity = s.authenticatedIdentity
 	}
+	peerIdentity := s.peerIdentity()
 	if parent.ipPool.HasIPv4() && !s.ifconfigInet4.IsValid() {
 		lease, err := parent.ipPool.AllocateIPv4ForIdentity(stickyIdentity)
 		if err != nil {
@@ -18,7 +19,7 @@ func (s *tlsServerSession) allocateAndRegisterTunnelAddress() error {
 		}
 		s.ifconfigInet4 = lease.Client
 		s.ifconfigPeer4 = lease.Peer
-		parent.routes.Register(lease.Client, s.peerAddress, s.tlsPeerSession)
+		parent.routes.Register(lease.Client, s.peerAddress, s.tlsPeerSession, peerIdentity)
 	}
 	if parent.ipPool.HasIPv6() && !s.ifconfigInet6.IsValid() {
 		address, err := parent.ipPool.AllocateIPv6ForIdentity(stickyIdentity)
@@ -26,7 +27,7 @@ func (s *tlsServerSession) allocateAndRegisterTunnelAddress() error {
 			return err
 		}
 		s.ifconfigInet6 = address
-		parent.routes.Register(address, s.peerAddress, s.tlsPeerSession)
+		parent.routes.Register(address, s.peerAddress, s.tlsPeerSession, peerIdentity)
 	}
 	return nil
 }

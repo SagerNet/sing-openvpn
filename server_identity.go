@@ -4,9 +4,17 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
+	"net/netip"
 
 	E "github.com/sagernet/sing/common/exceptions"
 )
+
+// Upstream hands these to scripts and the management interface as the
+// common_name and username of a client instance.
+type PeerIdentity struct {
+	CommonName string
+	Username   string
+}
 
 type tlsClientCertificateIdentity struct {
 	commonName string
@@ -72,4 +80,19 @@ func (s *tlsServerSession) authenticatedIdentityKey() string {
 		return "username:" + s.authenticatedUsername
 	}
 	return ""
+}
+
+func (s *tlsServerSession) peerIdentity() PeerIdentity {
+	var identity PeerIdentity
+	if certificateIdentity := s.lockedCertificateIdentity.Load(); certificateIdentity != nil {
+		identity.CommonName = certificateIdentity.commonName
+	}
+	if s.authenticatedUsernameSet {
+		identity.Username = s.authenticatedUsername
+	}
+	return identity
+}
+
+func (s *Server) LookupPeerIdentity(address netip.Addr) (PeerIdentity, bool) {
+	return s.routes.LookupIdentity(address)
 }
