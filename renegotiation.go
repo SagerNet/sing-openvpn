@@ -147,17 +147,19 @@ func (s *tlsPeerSession) beginSoftReset(keyID uint8, initiator bool) (*tlsRenego
 		nil,
 		nil,
 	)
-	if !s.controlChannel.registerRenegotiationChannel(keyID, state.channel) {
-		s.softResetAccess.Unlock()
-		return nil, false, E.New("tls mode: duplicate soft-reset key-id: ", keyID)
+	err := s.controlChannel.registerRenegotiationChannel(keyID, state.channel)
+	if err == nil {
+		s.renegotiations[keyID] = state
+		s.controlStream.beginHandover(state.sequence)
+		state.channel.loopWaitGroup.Add(1)
+		go state.channel.runSender()
 	}
-	s.renegotiations[keyID] = state
-	s.controlStream.beginHandover(state.sequence)
-	state.channel.loopWaitGroup.Add(1)
-	go state.channel.runSender()
 	s.softResetAccess.Unlock()
 	if replacedChannel != nil {
 		_ = replacedChannel.Close()
+	}
+	if err != nil {
+		return nil, false, err
 	}
 	return state, true, nil
 }

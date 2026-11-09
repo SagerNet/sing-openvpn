@@ -90,19 +90,18 @@ func newTLSControlChannel(
 	}
 }
 
-func (c *tlsControlChannel) registerRenegotiationChannel(keyID uint8, channel *tlsControlChannel) bool {
-	if keyID == 0 || keyID > proto.KeyIDMaxValue || channel == nil {
-		return false
-	}
+func (c *tlsControlChannel) registerRenegotiationChannel(keyID uint8, channel *tlsControlChannel) error {
 	readActivity, writeActivity := c.activityObservers()
 	channel.setActivityObservers(readActivity, writeActivity)
 	c.renegotiationAccess.Lock()
 	defer c.renegotiationAccess.Unlock()
-	if _, loaded := c.renegotiationChannels[keyID]; loaded {
-		return false
+	select {
+	case <-c.closed:
+		return net.ErrClosed
+	default:
 	}
 	c.renegotiationChannels[keyID] = channel
-	return true
+	return nil
 }
 
 func (c *tlsControlChannel) setActivityObservers(readActivity func(), writeActivity func()) {
@@ -640,6 +639,11 @@ func (c *tlsControlChannel) newAcknowledgmentPacket() (*proto.Packet, error) {
 func (c *tlsControlChannel) shutdown() {
 	c.closeOnce.Do(func() {
 		close(c.closed)
+		c.renegotiationAccess.Lock()
+		for _, channel := range c.renegotiationChannels {
+			channel.shutdown()
+		}
+		c.renegotiationAccess.Unlock()
 	})
 }
 
