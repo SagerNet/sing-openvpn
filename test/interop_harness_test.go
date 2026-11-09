@@ -65,7 +65,7 @@ var (
 		"2.5.11": {
 			version:        "2.5.11",
 			baseImage:      "ubuntu:22.04",
-			packageVersion: "2.5.11-0ubuntu0.22.04.4",
+			packageVersion: "2.5.11-0ubuntu0.22.04.6",
 			image:          "sing-openvpn-interop:2.5.11",
 		},
 		"2.6.14": {
