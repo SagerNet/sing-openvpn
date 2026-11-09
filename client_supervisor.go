@@ -56,7 +56,7 @@ func classifyClientSessionError(err error) clientSessionErrorClass {
 	if tokenAuthFailure {
 		return clientSessionErrorRetryable
 	}
-	if terminalError, isTerminalError := err.(interface{ Terminal() bool }); isTerminalError && terminalError.Terminal() {
+	if terminalError, isTerminalError := E.Cast[interface{ Terminal() bool }](err); isTerminalError && terminalError.Terminal() {
 		return clientSessionErrorTerminal
 	}
 	if E.IsMulti(

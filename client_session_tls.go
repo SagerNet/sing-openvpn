@@ -106,6 +106,12 @@ func newTLSClient(parent *Client, useActiveAuthToken bool, remote clientRemote) 
 				client.keepalive.noteRenegotiated(keyID)
 			}
 		},
+		// Upstream tls_multi_process gives up a tls_session once its key_state
+		// fails, and tls_pre_decrypt drops later control packets on that session
+		// id as stale; an upstream client negotiates a new tls_session instead.
+		onRenegotiationFailed: func(_ *tlsPeerSession, err error) {
+			client.finish(E.Cause(err, "renegotiate"))
+		},
 	}
 	client.hooks = tlsPeerHooks{
 		outgoingDataPayloads: func(payloads [][]byte, codec dataCodec, packetHeaderSize int) [][][]byte {

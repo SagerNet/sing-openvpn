@@ -164,15 +164,14 @@ func (s *tlsPeerSession) beginSoftReset(keyID uint8) (*tlsRenegotiationState, bo
 // reliable_get_entry_sequenced hands none of our packets on that key_state to
 // TLS before our packet ID 0.
 func (s *tlsPeerSession) runSoftResetState(state *tlsRenegotiationState) {
+	var newCodec dataCodec
 	err := state.channel.sendInitialSoftReset()
-	if err != nil {
-		s.finishSoftReset(state, nil, err)
-		return
+	if err == nil {
+		newCodec, err = s.roleCallbacks.renegotiate(s, state.channel, state.mustNegotiate)
 	}
-	newCodec, err := s.roleCallbacks.renegotiate(s, state.channel, state.mustNegotiate)
 	s.finishSoftReset(state, newCodec, err)
-	if err != nil && E.IsMulti(err, ErrAuthenticationFailed) && s.hooks.sessionTerminated != nil {
-		go s.hooks.sessionTerminated(err)
+	if err != nil {
+		go s.roleCallbacks.onRenegotiationFailed(s, err)
 	}
 }
 

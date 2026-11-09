@@ -11,11 +11,12 @@ import (
 )
 
 type tlsRoleCallbacks struct {
-	deriveKeyMaterial func(session *tlsPeerSession) ([]byte, error)
-	appendWrappedKey  func(session *tlsPeerSession, rawPacket []byte, opcode proto.Opcode) []byte
-	onTerminate       func(session *tlsPeerSession)
-	renegotiate       func(session *tlsPeerSession, channel *tlsControlChannel, mustNegotiate time.Time) (dataCodec, error)
-	onRenegotiated    func(session *tlsPeerSession, keyID uint8)
+	deriveKeyMaterial     func(session *tlsPeerSession) ([]byte, error)
+	appendWrappedKey      func(session *tlsPeerSession, rawPacket []byte, opcode proto.Opcode) []byte
+	onTerminate           func(session *tlsPeerSession)
+	renegotiate           func(session *tlsPeerSession, channel *tlsControlChannel, mustNegotiate time.Time) (dataCodec, error)
+	onRenegotiated        func(session *tlsPeerSession, keyID uint8)
+	onRenegotiationFailed func(session *tlsPeerSession, err error)
 }
 
 type (

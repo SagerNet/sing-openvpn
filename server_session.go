@@ -105,6 +105,11 @@ func (s *tlsServer) newSession(packetConnection proto.PacketConnection) *tlsServ
 		onRenegotiated: func(_ *tlsPeerSession, keyID uint8) {
 			session.noteRenegotiated(keyID)
 		},
+		onRenegotiationFailed: func(_ *tlsPeerSession, err error) {
+			if E.IsMulti(err, ErrAuthenticationFailed) {
+				_ = session.Close()
+			}
+		},
 	}
 	session.hooks = tlsPeerHooks{
 		outgoingDataPayloads: session.outgoingDataPayloads,
