@@ -606,7 +606,7 @@ func (c *tlsClient) runRenegotiation(channel *tlsControlChannel, mustNegotiate t
 		OptionsString: c.localOptionsString,
 		Username:      username,
 		Password:      password,
-		PeerInfo:      buildTLSPeerInfo(c.parent.options, false),
+		PeerInfo:      buildTLSPeerInfo(c.parent.options, c.parent.options.Pull.Enabled),
 		KeySource:     clientKeySource,
 	})
 	if err != nil {
