@@ -243,10 +243,7 @@ func (c *tlsControlChannel) Write(buffer []byte) (int, error) {
 			}
 			continue
 		}
-		err = c.writePacket(packet)
-		if err != nil {
-			return totalWritten, err
-		}
+		c.writePacket(packet)
 		totalWritten += chunkSize
 		buffer = buffer[chunkSize:]
 	}
@@ -364,7 +361,8 @@ func (c *tlsControlChannel) sendInitialSoftReset() error {
 	if packet == nil {
 		return net.ErrClosed
 	}
-	return c.writePacket(packet)
+	c.writePacket(packet)
+	return nil
 }
 
 func (c *tlsControlChannel) Close() error {
@@ -565,10 +563,6 @@ func (c *tlsControlChannel) processIncomingControlPacket(packet *proto.Packet) b
 	return true
 }
 
-// Upstream tls_process (ssl.c) leaves a control packet in the reliable send
-// buffer once reliable_mark_active_outgoing has armed its retransmit timer, and
-// a link write that fails afterwards only reaches check_status: the reliable
-// layer resends the packet and the key state is never reset because of it.
 func (c *tlsControlChannel) runSender() {
 	defer c.loopWaitGroup.Done()
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -582,7 +576,7 @@ func (c *tlsControlChannel) runSender() {
 		}
 		now := time.Now()
 		for _, packet := range c.outgoing.PacketsReadyToSend(now) {
-			_ = c.writePacket(packet)
+			c.writePacket(packet)
 		}
 		if c.outgoing.PendingAcknowledgmentCount() == 0 {
 			continue
@@ -591,7 +585,7 @@ func (c *tlsControlChannel) runSender() {
 		if err != nil {
 			continue
 		}
-		_ = c.writePacket(ackPacket)
+		c.writePacket(ackPacket)
 	}
 }
 
@@ -647,7 +641,11 @@ func (c *tlsControlChannel) shutdown() {
 	})
 }
 
-func (c *tlsControlChannel) writePacket(packet *proto.Packet) error {
+// Upstream tls_process (ssl.c) leaves a control packet in the reliable send
+// buffer once reliable_mark_active_outgoing has armed its retransmit timer, and
+// a link write that fails afterwards only reaches check_status: the reliable
+// layer resends the packet and the key state is never reset because of it.
+func (c *tlsControlChannel) writePacket(packet *proto.Packet) {
 	outgoingPacket := packet
 	if c.shouldSendWrappedClientKey(packet) && packet.Opcode != proto.OpcodeControlWKCv1 {
 		packetCopy := *packet
@@ -671,10 +669,9 @@ func (c *tlsControlChannel) writePacket(packet *proto.Packet) error {
 		if outgoingPacket.Opcode == proto.OpcodeAcknowledgmentV1 {
 			c.outgoing.ReturnAcknowledgmentIDs(outgoingPacket.AcknowledgmentIDs)
 		}
-		return err
+		return
 	}
 	c.markWriteActivity()
-	return nil
 }
 
 func (c *tlsControlChannel) shouldSendWrappedClientKey(packet *proto.Packet) bool {
