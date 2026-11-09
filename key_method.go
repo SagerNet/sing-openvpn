@@ -8,6 +8,7 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"hash"
+	"io"
 	"runtime"
 	"strconv"
 	"strings"
@@ -283,47 +284,41 @@ func parseTLSKeyMethod2Payload(payload []byte, server bool) (tlsKeyMethodMessage
 	if keyMethod&0x0f != tlsKeyMethod2 {
 		return tlsKeyMethodMessage{}, E.New("unsupported key-method")
 	}
-	keySource := tlsKeyMethodKeySource{}
+	var message tlsKeyMethodMessage
 	if !server {
-		keySource.PreMaster = make([]byte, 48)
-		_, err = reader.Read(keySource.PreMaster)
+		message.KeySource.PreMaster = make([]byte, 48)
+		_, err = io.ReadFull(reader, message.KeySource.PreMaster)
 		if err != nil {
 			return tlsKeyMethodMessage{}, err
 		}
 	}
-	keySource.Random1 = make([]byte, 32)
-	_, err = reader.Read(keySource.Random1)
+	message.KeySource.Random1 = make([]byte, 32)
+	_, err = io.ReadFull(reader, message.KeySource.Random1)
 	if err != nil {
 		return tlsKeyMethodMessage{}, err
 	}
-	keySource.Random2 = make([]byte, 32)
-	_, err = reader.Read(keySource.Random2)
+	message.KeySource.Random2 = make([]byte, 32)
+	_, err = io.ReadFull(reader, message.KeySource.Random2)
 	if err != nil {
 		return tlsKeyMethodMessage{}, err
 	}
-	optionsString, err := readLengthPrefixedString(reader)
+	message.OptionsString, err = readLengthPrefixedString(reader)
 	if err != nil {
 		return tlsKeyMethodMessage{}, err
 	}
-	username, err := readLengthPrefixedString(reader)
-	if err != nil {
-		return tlsKeyMethodMessage{}, err
+	// Upstream key_method_2_read reads a missing username, password or
+	// peer-info as empty, and openvpn3 core servers (ProtoContext::send_auth)
+	// end the message after the options string.
+	for _, field := range []*string{&message.Username, &message.Password, &message.PeerInfo} {
+		if reader.Len() == 0 {
+			break
+		}
+		*field, err = readLengthPrefixedString(reader)
+		if err != nil {
+			return tlsKeyMethodMessage{}, err
+		}
 	}
-	password, err := readLengthPrefixedString(reader)
-	if err != nil {
-		return tlsKeyMethodMessage{}, err
-	}
-	peerInfo, err := readLengthPrefixedString(reader)
-	if err != nil {
-		return tlsKeyMethodMessage{}, err
-	}
-	return tlsKeyMethodMessage{
-		OptionsString: optionsString,
-		Username:      username,
-		Password:      password,
-		PeerInfo:      peerInfo,
-		KeySource:     keySource,
-	}, nil
+	return message, nil
 }
 
 func peerInfoIVProto(peerInfo string) (int, bool) {
@@ -487,7 +482,7 @@ func readLengthPrefixedString(reader *bytes.Reader) (string, error) {
 		return "", nil
 	}
 	stringBytes := make([]byte, int(length))
-	_, err = reader.Read(stringBytes)
+	_, err = io.ReadFull(reader, stringBytes)
 	if err != nil {
 		return "", err
 	}
