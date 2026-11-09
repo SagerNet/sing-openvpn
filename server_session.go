@@ -63,9 +63,9 @@ func (s *tlsServer) newSession(packetConnection proto.PacketConnection) *tlsServ
 	handshakeWindow := s.parent.options.Timing.HandWindow
 	session := &tlsServerSession{
 		tlsPeerSession: &tlsPeerSession{
-			role:                    tlsRoleServer,
 			packetConnection:        packetConnection,
 			dataTransportHeaderSize: dataTransportHeaderSize(s.parent.protocol),
+			authDeferredWindow:      authDeferredExpireWindow(handshakeWindow, s.parent.options.Timing.RenegotiationInterval),
 			handshakeWindow:         handshakeWindow,
 		},
 		server:            s,

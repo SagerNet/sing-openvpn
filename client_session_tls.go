@@ -54,11 +54,11 @@ func newTLSClient(parent *Client, useActiveAuthToken bool, remote clientRemote) 
 	}
 	client := &tlsClient{
 		tlsPeerSession: &tlsPeerSession{
-			role:                    tlsRoleClient,
 			sessionManager:          sessionManager,
 			protection:              protection,
 			wrappedClientKey:        wrappedClientKey,
 			dataTransportHeaderSize: dataTransportHeaderSize(remote.remote.Protocol),
+			authDeferredWindow:      authDeferredExpireWindow(parent.options.Timing.HandWindow, parent.options.Timing.RenegotiationInterval),
 			handshakeWindow:         parent.options.Timing.HandWindow,
 		},
 		parent:             parent,

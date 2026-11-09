@@ -152,7 +152,6 @@ func (s *tlsPeerSession) handleIncomingDataPackets(packets []*proto.Packet) {
 		if readUsageObserver != nil {
 			readUsageObserver(packet.KeyID, packetID, decodedPayload.Len())
 		}
-		s.confirmDataKey(packet.KeyID)
 		if authenticatedObserver := s.currentAuthenticatedDataPacketObserver(); authenticatedObserver != nil && !authenticatedObserver() {
 			decodedPayload.Release()
 			continue
@@ -227,6 +226,13 @@ type tlsReceiveCodec struct {
 	sequence uint64
 }
 
+type tlsSendKey struct {
+	codec              dataCodec
+	keyID              uint8
+	sessionManager     *proto.SessionManager
+	authDeferredExpire time.Time
+}
+
 // Upstream --tran-window defaults to 3600 seconds.
 const tlsTransitionWindow = 3600 * time.Second
 
@@ -236,30 +242,21 @@ const tlsKeyScanSize = 3
 func (s *tlsPeerSession) installInitialDataCodec(codec dataCodec, keyID uint8) {
 	s.dataKeyAccess.Lock()
 	defer s.dataKeyAccess.Unlock()
-	s.dataCodec = codec
-	s.sendCodec = codec
-	s.sendKeyID = keyID
-	s.sendSessionManager = s.sessionManager
+	s.sendKey = tlsSendKey{codec: codec, keyID: keyID, sessionManager: s.sessionManager}
 	s.receiveCodecs = []tlsReceiveCodec{{keyID: keyID, codec: codec}}
 }
 
-func (s *tlsPeerSession) installDataKeyState(
-	codec dataCodec,
-	keyID uint8,
-	manager *proto.SessionManager,
-	sequence uint64,
-	promote bool,
-) {
+func (s *tlsPeerSession) installDataKeyState(state *tlsRenegotiationState, codec dataCodec, promote bool) {
 	s.dataKeyAccess.Lock()
 	defer s.dataKeyAccess.Unlock()
 	now := time.Now()
 	expiry := now.Add(tlsTransitionWindow)
 	var retained []tlsReceiveCodec
 	for _, entry := range s.receiveCodecs {
-		if entry.keyID == keyID {
+		if entry.keyID == state.keyID {
 			continue
 		}
-		if promote && entry.keyID == s.sendKeyID {
+		if promote && entry.keyID == s.sendKey.keyID {
 			entry.expiry = expiry
 		}
 		if !entry.expiry.IsZero() && !now.Before(entry.expiry) {
@@ -267,7 +264,7 @@ func (s *tlsPeerSession) installDataKeyState(
 		}
 		retained = append(retained, entry)
 	}
-	newEntry := tlsReceiveCodec{keyID: keyID, codec: codec, sequence: sequence}
+	newEntry := tlsReceiveCodec{keyID: state.keyID, codec: codec, sequence: state.sequence}
 	if !promote {
 		newEntry.expiry = expiry
 	}
@@ -280,10 +277,13 @@ func (s *tlsPeerSession) installDataKeyState(
 	}
 	s.receiveCodecs = retained
 	if promote {
-		s.dataCodec = codec
-		s.sendCodec = codec
-		s.sendKeyID = keyID
-		s.sendSessionManager = manager
+		s.lameDuckSendKey = s.sendKey
+		s.sendKey = tlsSendKey{
+			codec:              codec,
+			keyID:              state.keyID,
+			sessionManager:     state.sessionManager,
+			authDeferredExpire: state.authDeferredExpire,
+		}
 	}
 }
 
@@ -294,7 +294,7 @@ func (s *tlsPeerSession) stageNegotiatedReceiveKey(keyID uint8, codec dataCodec)
 	if state == nil || state.status != tlsRenegotiationNegotiating {
 		return false
 	}
-	s.installDataKeyState(codec, keyID, state.sessionManager, state.sequence, false)
+	s.installDataKeyState(state, codec, false)
 	return true
 }
 
@@ -311,27 +311,28 @@ func (s *tlsPeerSession) discardDataKeyState(keyID uint8, sequence uint64) {
 	s.receiveCodecs = retained
 }
 
-func (s *tlsPeerSession) receiveDataCodec(keyID uint8, sequence uint64) dataCodec {
+func (s *tlsPeerSession) currentPrimaryKey() (dataCodec, uint8) {
 	s.dataKeyAccess.Lock()
 	defer s.dataKeyAccess.Unlock()
-	for _, entry := range s.receiveCodecs {
-		if entry.keyID == keyID && entry.sequence == sequence {
-			return entry.codec
-		}
-	}
-	return nil
+	return s.sendKey.codec, s.sendKey.keyID
 }
 
-func (s *tlsPeerSession) currentSendCodec() (dataCodec, uint8) {
-	s.dataKeyAccess.Lock()
-	defer s.dataKeyAccess.Unlock()
-	return s.sendCodec, s.sendKeyID
-}
-
+// Upstream tls_select_encryption_key (ssl.c) prefers the newest key_state
+// past its auth_deferred_expire, as a server with deferred authentication
+// drops data on a key_state until it succeeds.
 func (s *tlsPeerSession) currentSendKeyState() (dataCodec, uint8, *proto.SessionManager) {
 	s.dataKeyAccess.Lock()
 	defer s.dataKeyAccess.Unlock()
-	return s.sendCodec, s.sendKeyID, s.sendSessionManager
+	sendKey := s.sendKey
+	if s.lameDuckSendKey.codec != nil {
+		now := time.Now()
+		if !now.Before(sendKey.authDeferredExpire) {
+			s.lameDuckSendKey = tlsSendKey{}
+		} else if !now.Before(s.lameDuckSendKey.authDeferredExpire) {
+			sendKey = s.lameDuckSendKey
+		}
+	}
+	return sendKey.codec, sendKey.keyID, sendKey.sessionManager
 }
 
 // Upstream lame_duck_must_die expires old key_states before tls_pre_decrypt.

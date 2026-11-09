@@ -17,27 +17,25 @@ type tlsRenegotiationStatus uint8
 
 const (
 	tlsRenegotiationNegotiating tlsRenegotiationStatus = iota
-	tlsRenegotiationAwaitingData
 	tlsRenegotiationActive
 	tlsRenegotiationLameDuck
 	tlsRenegotiationFailed
 )
 
 type tlsRenegotiationState struct {
-	keyID          uint8
-	sequence       uint64
-	mustNegotiate  time.Time
-	sessionManager *proto.SessionManager
-	channel        *tlsControlChannel
-	done           chan struct{}
-	finishOnce     sync.Once
+	keyID              uint8
+	sequence           uint64
+	mustNegotiate      time.Time
+	authDeferredExpire time.Time
+	sessionManager     *proto.SessionManager
+	channel            *tlsControlChannel
+	done               chan struct{}
+	finishOnce         sync.Once
 
 	status      tlsRenegotiationStatus
 	resultErr   error
 	expiresAt   time.Time
 	expiryTimer *time.Timer
-
-	peerDataConfirmed bool
 }
 
 // Upstream should_trigger_renegotiation calls key_state_soft_reset and
@@ -46,7 +44,7 @@ func (s *tlsPeerSession) triggerSoftReset() error {
 	if s.roleCallbacks.renegotiate == nil {
 		return E.New("tls mode: renegotiation not supported for role")
 	}
-	if sendCodec, _ := s.currentSendCodec(); sendCodec == nil {
+	if primaryCodec, _ := s.currentPrimaryKey(); primaryCodec == nil {
 		return ErrDataChannelNotReady
 	}
 
@@ -78,8 +76,7 @@ func (s *tlsPeerSession) beginLocalSoftReset() (*tlsRenegotiationState, bool, er
 	s.softResetAccess.Lock()
 	var newest *tlsRenegotiationState
 	for _, state := range s.renegotiations {
-		if (state.status == tlsRenegotiationNegotiating || state.status == tlsRenegotiationAwaitingData) &&
-			(newest == nil || state.sequence > newest.sequence) {
+		if state.status == tlsRenegotiationNegotiating && (newest == nil || state.sequence > newest.sequence) {
 			newest = state
 		}
 	}
@@ -88,8 +85,8 @@ func (s *tlsPeerSession) beginLocalSoftReset() (*tlsRenegotiationState, bool, er
 		return newest, false, nil
 	}
 
-	_, currentKeyID := s.currentSendCodec()
-	return s.beginSoftReset(proto.NextKeyID(currentKeyID))
+	_, primaryKeyID := s.currentPrimaryKey()
+	return s.beginSoftReset(proto.NextKeyID(primaryKeyID))
 }
 
 func (s *tlsPeerSession) beginSoftReset(keyID uint8) (*tlsRenegotiationState, bool, error) {
@@ -110,8 +107,8 @@ func (s *tlsPeerSession) beginSoftReset(keyID uint8) (*tlsRenegotiationState, bo
 		s.renegotiations = make(map[uint8]*tlsRenegotiationState)
 	}
 	if existing := s.renegotiations[keyID]; existing != nil {
-		_, currentKeyID := s.currentSendCodec()
-		if existing.status == tlsRenegotiationNegotiating || existing.status == tlsRenegotiationAwaitingData || currentKeyID == keyID {
+		_, primaryKeyID := s.currentPrimaryKey()
+		if existing.status == tlsRenegotiationNegotiating || primaryKeyID == keyID {
 			s.softResetAccess.Unlock()
 			return existing, false, nil
 		}
@@ -125,13 +122,15 @@ func (s *tlsPeerSession) beginSoftReset(keyID uint8) (*tlsRenegotiationState, bo
 
 	s.renegotiationSequence++
 	stateManager := s.sessionManager.NewRenegotiationSessionManager(keyID)
+	now := time.Now()
 	state := &tlsRenegotiationState{
-		keyID:          keyID,
-		sequence:       s.renegotiationSequence,
-		mustNegotiate:  time.Now().Add(s.handshakeWindow),
-		sessionManager: stateManager,
-		done:           make(chan struct{}),
-		status:         tlsRenegotiationNegotiating,
+		keyID:              keyID,
+		sequence:           s.renegotiationSequence,
+		mustNegotiate:      now.Add(s.handshakeWindow),
+		authDeferredExpire: now.Add(s.authDeferredWindow),
+		sessionManager:     stateManager,
+		done:               make(chan struct{}),
+		status:             tlsRenegotiationNegotiating,
 	}
 	state.channel = newTLSControlChannel(
 		s.packetConnection,
@@ -143,6 +142,9 @@ func (s *tlsPeerSession) beginSoftReset(keyID uint8) (*tlsRenegotiationState, bo
 	err := s.controlChannel.registerRenegotiationChannel(keyID, state.channel)
 	if err == nil {
 		s.renegotiations[keyID] = state
+		s.dataKeyAccess.Lock()
+		s.lameDuckSendKey = tlsSendKey{}
+		s.dataKeyAccess.Unlock()
 		s.controlStream.beginHandover(state.sequence)
 		state.channel.loopWaitGroup.Add(1)
 		go state.channel.runSender()
@@ -197,10 +199,6 @@ func (s *tlsPeerSession) finishSoftReset(state *tlsRenegotiationState, codec dat
 			}
 			channelsToClose = append(channelsToClose, state.channel)
 		} else {
-			// Upstream selects the newly generated primary key for outbound
-			// data immediately.  Receiving a data packet with the new key is
-			// not a prerequisite; the previous key remains receive-capable as
-			// a lame duck for the transition window.
 			promoted = s.promoteKeyStateLocked(state, codec)
 			state.resultErr = nil
 			channelsToClose = append(channelsToClose, s.pruneRenegotiationsLocked(time.Now())...)
@@ -217,6 +215,14 @@ func (s *tlsPeerSession) finishSoftReset(state *tlsRenegotiationState, codec dat
 	})
 }
 
+// Upstream auth_deferred_expire_window (ssl.c).
+func authDeferredExpireWindow(handshakeWindow time.Duration, renegotiationInterval time.Duration) time.Duration {
+	if renegotiationInterval > 0 {
+		return min(handshakeWindow, renegotiationInterval/2)
+	}
+	return handshakeWindow
+}
+
 func (s *tlsPeerSession) makeLameDuckLocked(state *tlsRenegotiationState, now time.Time) {
 	state.status = tlsRenegotiationLameDuck
 	state.expiresAt = now.Add(tlsTransitionWindow)
@@ -227,7 +233,7 @@ func (s *tlsPeerSession) promoteKeyStateLocked(state *tlsRenegotiationState, cod
 	if state.sequence <= s.promotedKeyStateSequence {
 		state.status = tlsRenegotiationLameDuck
 		state.expiresAt = time.Now().Add(tlsTransitionWindow)
-		s.installDataKeyState(codec, state.keyID, state.sessionManager, state.sequence, false)
+		s.installDataKeyState(state, codec, false)
 		s.armKeyStateExpiryLocked(state)
 		s.controlStream.abortHandover(state.sequence)
 		return false
@@ -241,41 +247,9 @@ func (s *tlsPeerSession) promoteKeyStateLocked(state *tlsRenegotiationState, cod
 	}
 	s.promotedKeyStateSequence = state.sequence
 	state.status = tlsRenegotiationActive
-	s.installDataKeyState(codec, state.keyID, state.sessionManager, state.sequence, true)
+	s.installDataKeyState(state, codec, true)
 	s.controlStream.install(state.channel, state.sequence)
 	return true
-}
-
-func (s *tlsPeerSession) confirmDataKey(keyID uint8) {
-	if s.role != tlsRoleServer {
-		return
-	}
-	var channelsToClose []*tlsControlChannel
-	promoted := false
-	s.softResetAccess.Lock()
-	state := s.renegotiations[keyID]
-	if state == nil {
-		s.softResetAccess.Unlock()
-		return
-	}
-	switch state.status {
-	case tlsRenegotiationNegotiating:
-		state.peerDataConfirmed = true
-	case tlsRenegotiationAwaitingData:
-		state.peerDataConfirmed = true
-		codec := s.receiveDataCodec(keyID, state.sequence)
-		if codec != nil {
-			promoted = s.promoteKeyStateLocked(state, codec)
-			channelsToClose = append(channelsToClose, s.pruneRenegotiationsLocked(time.Now())...)
-		}
-	}
-	s.softResetAccess.Unlock()
-	if promoted && s.roleCallbacks.onRenegotiated != nil {
-		s.roleCallbacks.onRenegotiated(s, keyID)
-	}
-	for _, channel := range channelsToClose {
-		_ = channel.Close()
-	}
 }
 
 func (s *tlsPeerSession) armKeyStateExpiryLocked(state *tlsRenegotiationState) {
@@ -294,8 +268,7 @@ func (s *tlsPeerSession) expireKeyState(state *tlsRenegotiationState) {
 		s.softResetAccess.Unlock()
 		return
 	}
-	retiring := state.status == tlsRenegotiationLameDuck || state.status == tlsRenegotiationAwaitingData
-	if !retiring || time.Now().Before(state.expiresAt) {
+	if state.status != tlsRenegotiationLameDuck || time.Now().Before(state.expiresAt) {
 		s.softResetAccess.Unlock()
 		return
 	}
@@ -308,7 +281,7 @@ func (s *tlsPeerSession) pruneRenegotiationsLocked(now time.Time) []*tlsControlC
 	var completed []*tlsRenegotiationState
 	var channelsToClose []*tlsControlChannel
 	for _, state := range s.renegotiations {
-		retiring := state.status == tlsRenegotiationLameDuck || state.status == tlsRenegotiationAwaitingData
+		retiring := state.status == tlsRenegotiationLameDuck
 		if retiring && !now.Before(state.expiresAt) {
 			s.removeRenegotiationLocked(state)
 			channelsToClose = append(channelsToClose, state.channel)
@@ -368,8 +341,8 @@ func (s *tlsPeerSession) handleIncomingSoftReset(packet *proto.Packet) {
 	if packet == nil {
 		return
 	}
-	sendCodec, _ := s.currentSendCodec()
-	if sendCodec == nil {
+	primaryCodec, _ := s.currentPrimaryKey()
+	if primaryCodec == nil {
 		return
 	}
 	packetCopy := *packet

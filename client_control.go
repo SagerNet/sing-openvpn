@@ -198,8 +198,8 @@ func (c *tlsClient) sendExplicitExitNotifyIfRequested() {
 		_ = c.writeControlChannelPayload(tlsControlChannelExitPayload, exitDeadline)
 		return
 	}
-	sendCodec, _ := c.currentSendCodec()
-	if sendCodec == nil {
+	primaryCodec, _ := c.currentPrimaryKey()
+	if primaryCodec == nil {
 		return
 	}
 	// Upstream process_explicit_exit_notification_timer_wakeup (forward.c)

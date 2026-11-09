@@ -10,13 +10,6 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
-type tlsRole uint8
-
-const (
-	tlsRoleClient tlsRole = iota
-	tlsRoleServer
-)
-
 type tlsRoleCallbacks struct {
 	deriveKeyMaterial func(session *tlsPeerSession) ([]byte, error)
 	appendWrappedKey  func(session *tlsPeerSession, rawPacket []byte, opcode proto.Opcode) []byte
@@ -41,7 +34,6 @@ func checkTLSKeySourcesComplete(session *tlsPeerSession) error {
 }
 
 type tlsPeerSession struct {
-	role          tlsRole
 	roleCallbacks tlsRoleCallbacks
 	hooks         tlsPeerHooks
 
@@ -49,9 +41,9 @@ type tlsPeerSession struct {
 	sessionManager          *proto.SessionManager
 	controlChannel          *tlsControlChannel
 	tlsConnection           *tls.Conn
-	dataCodec               dataCodec
 	protection              tlsControlProtection
 	dataTransportHeaderSize int
+	authDeferredWindow      time.Duration
 	// Upstream key_state_init (ssl.c) stamps every key_state with
 	// must_negotiate = now + session->opt->handshake_window, and tls_process
 	// fails the key_state once now passes it before S_ACTIVE.
@@ -62,12 +54,11 @@ type tlsPeerSession struct {
 	controlStream   tlsPrimaryControlStream
 
 	// Upstream tls_pre_decrypt keeps recent key_states addressable by key_id.
-	dataKeyAccess      sync.Mutex
-	dataWriteAccess    sync.Mutex
-	sendCodec          dataCodec
-	sendKeyID          uint8
-	sendSessionManager *proto.SessionManager
-	receiveCodecs      []tlsReceiveCodec
+	dataKeyAccess   sync.Mutex
+	dataWriteAccess sync.Mutex
+	sendKey         tlsSendKey
+	lameDuckSendKey tlsSendKey
+	receiveCodecs   []tlsReceiveCodec
 
 	softResetAccess          sync.Mutex
 	renegotiations           map[uint8]*tlsRenegotiationState
