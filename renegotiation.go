@@ -26,7 +26,6 @@ const (
 type tlsRenegotiationState struct {
 	keyID          uint8
 	sequence       uint64
-	initiator      bool
 	mustNegotiate  time.Time
 	sessionManager *proto.SessionManager
 	channel        *tlsControlChannel
@@ -56,7 +55,7 @@ func (s *tlsPeerSession) triggerSoftReset() error {
 		return err
 	}
 	if created {
-		s.runSoftResetState(state, nil)
+		s.runSoftResetState(state)
 	}
 	<-state.done
 	return state.resultErr
@@ -65,19 +64,14 @@ func (s *tlsPeerSession) triggerSoftReset() error {
 // Upstream process_incoming_link_part2 handles P_CONTROL_SOFT_RESET_V1
 // by rekeying in place on the requested key_id.
 func (s *tlsPeerSession) handleIncomingSoftResetPacket(packet *proto.Packet) {
-	if packet == nil || packet.KeyID == 0 || packet.KeyID > proto.KeyIDMaxValue {
+	state, created, err := s.beginSoftReset(packet.KeyID)
+	if err != nil {
 		return
 	}
-	state, created, err := s.beginSoftReset(packet.KeyID, false)
-	if err != nil || state == nil {
-		return
-	}
-	packetCopy := *packet
+	state.channel.processIncomingControlPacket(packet)
 	if created {
-		s.runSoftResetState(state, &packetCopy)
-		return
+		s.runSoftResetState(state)
 	}
-	state.channel.processIncomingControlPacket(&packetCopy)
 }
 
 func (s *tlsPeerSession) beginLocalSoftReset() (*tlsRenegotiationState, bool, error) {
@@ -95,10 +89,10 @@ func (s *tlsPeerSession) beginLocalSoftReset() (*tlsRenegotiationState, bool, er
 	}
 
 	_, currentKeyID := s.currentSendCodec()
-	return s.beginSoftReset(proto.NextKeyID(currentKeyID), true)
+	return s.beginSoftReset(proto.NextKeyID(currentKeyID))
 }
 
-func (s *tlsPeerSession) beginSoftReset(keyID uint8, initiator bool) (*tlsRenegotiationState, bool, error) {
+func (s *tlsPeerSession) beginSoftReset(keyID uint8) (*tlsRenegotiationState, bool, error) {
 	if keyID == 0 || keyID > proto.KeyIDMaxValue {
 		return nil, false, E.New("tls mode: invalid soft-reset key-id: ", keyID)
 	}
@@ -134,7 +128,6 @@ func (s *tlsPeerSession) beginSoftReset(keyID uint8, initiator bool) (*tlsRenego
 	state := &tlsRenegotiationState{
 		keyID:          keyID,
 		sequence:       s.renegotiationSequence,
-		initiator:      initiator,
 		mustNegotiate:  time.Now().Add(s.handshakeWindow),
 		sessionManager: stateManager,
 		done:           make(chan struct{}),
@@ -164,17 +157,16 @@ func (s *tlsPeerSession) beginSoftReset(keyID uint8, initiator bool) (*tlsRenego
 	return state, true, nil
 }
 
-func (s *tlsPeerSession) runSoftResetState(state *tlsRenegotiationState, incomingSoftReset *proto.Packet) {
-	if state.initiator {
-		softResetErr := state.channel.sendInitialSoftReset()
-		if softResetErr != nil {
-			s.finishSoftReset(state, nil, softResetErr)
-			return
-		}
-	} else if incomingSoftReset != nil {
-		state.channel.processIncomingControlPacket(incomingSoftReset)
+// An upstream peer runs the new key_state through session_move_pre_start
+// whichever side sent the first P_CONTROL_SOFT_RESET_V1, and its
+// reliable_get_entry_sequenced hands none of our packets on that key_state to
+// TLS before our packet ID 0.
+func (s *tlsPeerSession) runSoftResetState(state *tlsRenegotiationState) {
+	err := state.channel.sendInitialSoftReset()
+	if err != nil {
+		s.finishSoftReset(state, nil, err)
+		return
 	}
-
 	newCodec, err := s.roleCallbacks.renegotiate(s, state.channel, state.mustNegotiate)
 	s.finishSoftReset(state, newCodec, err)
 	if err != nil && E.IsMulti(err, ErrAuthenticationFailed) && s.hooks.sessionTerminated != nil {
