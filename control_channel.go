@@ -39,6 +39,7 @@ type tlsControlChannel struct {
 	closed           chan struct{}
 	loopWaitGroup    sync.WaitGroup
 	outgoingAccess   sync.Mutex
+	pendingOutgoing  []byte
 	readAccess       sync.Mutex
 	readRemainder    []byte
 	deadlineAccess   sync.Mutex
@@ -223,31 +224,41 @@ func (c *tlsControlChannel) Read(buffer []byte) (int, error) {
 }
 
 func (c *tlsControlChannel) Write(buffer []byte) (int, error) {
-	totalWritten := 0
-	for len(buffer) > 0 {
-		writeDeadline, hasDeadline := c.currentWriteDeadline()
-		if hasDeadline && !time.Now().Before(writeDeadline) {
-			return totalWritten, os.ErrDeadlineExceeded
-		}
-		packet, chunkSize, err := c.newOutgoingControlPacket(buffer)
-		if err != nil {
-			return totalWritten, err
-		}
-		if packet == nil {
-			timer := time.NewTimer(10 * time.Millisecond)
-			select {
-			case <-c.closed:
-				timer.Stop()
-				return totalWritten, net.ErrClosed
-			case <-timer.C:
-			}
-			continue
-		}
-		c.writePacket(packet)
-		totalWritten += chunkSize
-		buffer = buffer[chunkSize:]
+	writeDeadline, hasDeadline := c.currentWriteDeadline()
+	if hasDeadline && !time.Now().Before(writeDeadline) {
+		return 0, os.ErrDeadlineExceeded
 	}
-	return totalWritten, nil
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	default:
+	}
+	packets, err := c.queueOutgoing(buffer)
+	for _, packet := range packets {
+		c.writePacket(packet)
+	}
+	return len(buffer), err
+}
+
+// Upstream key_state_write_plaintext hands the plaintext to the TLS object of
+// the key_state, whose ciphertext waits in a memory BIO until tls_process finds
+// a free slot in the reliable send buffer, so a control channel write never
+// waits for the peer to acknowledge earlier packets.
+func (c *tlsControlChannel) queueOutgoing(buffer []byte) ([]*proto.Packet, error) {
+	c.outgoingAccess.Lock()
+	defer c.outgoingAccess.Unlock()
+	c.pendingOutgoing = append(c.pendingOutgoing, buffer...)
+	var packets []*proto.Packet
+	for len(c.pendingOutgoing) > 0 {
+		packet, chunkSize, err := c.newOutgoingControlPacketLocked(c.pendingOutgoing)
+		if err != nil || packet == nil {
+			return packets, err
+		}
+		packets = append(packets, packet)
+		c.pendingOutgoing = c.pendingOutgoing[chunkSize:]
+	}
+	c.pendingOutgoing = nil
+	return packets, nil
 }
 
 // Upstream write_outgoing_tls_ciphertext takes the reliable send buffer slot
@@ -257,9 +268,7 @@ func (c *tlsControlChannel) Write(buffer []byte) (int, error) {
 // wrapped client key is shortened by that key's length, down to an empty
 // payload when the key alone fills the packet.  No packet is returned while the
 // reliable send buffer holds no free slot.
-func (c *tlsControlChannel) newOutgoingControlPacket(buffer []byte) (*proto.Packet, int, error) {
-	c.outgoingAccess.Lock()
-	defer c.outgoingAccess.Unlock()
+func (c *tlsControlChannel) newOutgoingControlPacketLocked(buffer []byte) (*proto.Packet, int, error) {
 	payloadSize := min(tlsControlPayloadSize, tlsControlChannelMTU) -
 		c.controlChannelFrameOverhead(c.outgoing.PendingAcknowledgmentCount())
 	if c.nextPacketCarriesWrappedClientKey() {
@@ -321,13 +330,13 @@ func (c *tlsControlChannel) nextPacketCarriesWrappedClientKey() bool {
 
 func (c *tlsControlChannel) waitForReliableDelivery(timeout time.Duration) bool {
 	if timeout <= 0 {
-		return !c.outgoing.HasInFlightPackets()
+		return !c.hasUndeliveredOutgoing()
 	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
-	for c.outgoing.HasInFlightPackets() {
+	for c.hasUndeliveredOutgoing() {
 		select {
 		case <-c.closed:
 			return false
@@ -337,6 +346,12 @@ func (c *tlsControlChannel) waitForReliableDelivery(timeout time.Duration) bool 
 		}
 	}
 	return true
+}
+
+func (c *tlsControlChannel) hasUndeliveredOutgoing() bool {
+	c.outgoingAccess.Lock()
+	defer c.outgoingAccess.Unlock()
+	return len(c.pendingOutgoing) > 0 || c.outgoing.HasInFlightPackets()
 }
 
 // Upstream session_move_pre_start sends the soft-reset initial_opcode as
@@ -574,6 +589,7 @@ func (c *tlsControlChannel) runSender() {
 			return
 		case <-ticker.C:
 		}
+		_, _ = c.queueOutgoing(nil)
 		now := time.Now()
 		for _, packet := range c.outgoing.PacketsReadyToSend(now) {
 			c.writePacket(packet)
