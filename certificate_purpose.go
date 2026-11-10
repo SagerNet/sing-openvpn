@@ -53,9 +53,6 @@ const (
 	openSSLExtendedKeyUsageServerGatedCrypto = 0x10
 )
 
-// OpenSSL NS_SSL_CA, checked by check_ssl_ca.
-const netscapeCertTypeSSLCertificateAuthority = 0x04
-
 var openSSLExtendedKeyUsageBits = []struct {
 	identifier asn1.ObjectIdentifier
 	bit        uint
@@ -79,7 +76,9 @@ const (
 
 // OpenSSL check_purpose_ssl_client / check_purpose_ssl_server, with
 // requireCertificateAuthority selecting check_ssl_ca as check_chain does for
-// every certificate above the leaf.
+// every certificate above the leaf. check_ssl_ca reads Netscape Cert Type
+// only for a certificate carrying neither basicConstraints nor keyUsage, which
+// chain verification never accepts as an issuer.
 func checkCertificatePurpose(certificate *x509.Certificate, purpose certificatePurpose, requireCertificateAuthority bool) (bool, error) {
 	usage, err := readCertificateUsageExtensions(certificate)
 	if err != nil {
@@ -91,7 +90,7 @@ func checkCertificatePurpose(certificate *x509.Certificate, purpose certificateP
 			return false, nil
 		}
 		if requireCertificateAuthority {
-			return !usage.rejectsNetscapeCertType(netscapeCertTypeSSLCertificateAuthority), nil
+			return true, nil
 		}
 		if usage.rejectsKeyUsage(openSSLKeyUsageDigitalSignature | openSSLKeyUsageKeyAgreement) {
 			return false, nil
@@ -102,7 +101,7 @@ func checkCertificatePurpose(certificate *x509.Certificate, purpose certificateP
 			return false, nil
 		}
 		if requireCertificateAuthority {
-			return !usage.rejectsNetscapeCertType(netscapeCertTypeSSLCertificateAuthority), nil
+			return true, nil
 		}
 		if usage.rejectsNetscapeCertType(netscapeCertTypeSSLServer) {
 			return false, nil
