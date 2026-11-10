@@ -401,8 +401,9 @@ func requireCAOrPeerFingerprint(roots *certificatePool, peerFingerprints []strin
 	return ErrMissingCAOrPeerFingerprint
 }
 
-// Upstream tls_get_cipher_name_pair accepts OpenSSL and IANA names for
-// TLS 1.2 cipher suites.
+// Upstream tls_get_cipher_name_pair translates OpenSSL names and IANA names
+// written with '-' for TLS 1.2 cipher suites; OpenSSL 3.2 and later also
+// accept IANA names written with '_'.
 type tlsCipherNamePair struct {
 	openSSLName string
 	suiteID     uint16
@@ -455,36 +456,36 @@ func parseTLSCipherSuites(input string) ([]uint16, error) {
 		seen[suiteID] = struct{}{}
 		suiteIDs = append(suiteIDs, suiteID)
 	}
-	if len(suiteIDs) == 0 {
-		return nil, E.New("tls-cipher yielded no supported TLS 1.2 cipher suites")
-	}
 	return suiteIDs, nil
 }
 
 func lookupTLSCipherSuite(token string) (uint16, error) {
+	ianaName := strings.ReplaceAll(token, "-", "_")
 	for _, pair := range tlsCipherTranslationTable {
-		if pair.openSSLName == token || tls.CipherSuiteName(pair.suiteID) == token {
+		if pair.openSSLName == token || tls.CipherSuiteName(pair.suiteID) == ianaName {
 			return pair.suiteID, nil
 		}
 	}
 	return 0, E.New("unsupported tls-cipher name: ", token)
 }
 
-// Upstream tls_ctx_set_tls_groups feeds --tls-groups into
-// SSL_CTX_set1_groups_list after OpenSSL name normalization.
+// Upstream tls_ctx_set_tls_groups passes --tls-groups to OpenSSL or mbedTLS,
+// which spell groups as secp256r1, prime256v1, X25519 or x25519; OpenSSL 3.5
+// and later also accept X25519MLKEM768 and match names case-insensitively.
 var tlsGroupAliases = map[string]tls.CurveID{
-	"X25519":     tls.X25519,
-	"CURVE25519": tls.X25519,
-	"SECP256R1":  tls.CurveP256,
-	"PRIME256V1": tls.CurveP256,
-	"P-256":      tls.CurveP256,
-	"NISTP256":   tls.CurveP256,
-	"SECP384R1":  tls.CurveP384,
-	"P-384":      tls.CurveP384,
-	"NISTP384":   tls.CurveP384,
-	"SECP521R1":  tls.CurveP521,
-	"P-521":      tls.CurveP521,
-	"NISTP521":   tls.CurveP521,
+	"X25519":         tls.X25519,
+	"CURVE25519":     tls.X25519,
+	"X25519MLKEM768": tls.X25519MLKEM768,
+	"SECP256R1":      tls.CurveP256,
+	"PRIME256V1":     tls.CurveP256,
+	"P-256":          tls.CurveP256,
+	"NISTP256":       tls.CurveP256,
+	"SECP384R1":      tls.CurveP384,
+	"P-384":          tls.CurveP384,
+	"NISTP384":       tls.CurveP384,
+	"SECP521R1":      tls.CurveP521,
+	"P-521":          tls.CurveP521,
+	"NISTP521":       tls.CurveP521,
 }
 
 func parseTLSGroups(input string) ([]tls.CurveID, error) {
@@ -498,7 +499,7 @@ func parseTLSGroups(input string) ([]tls.CurveID, error) {
 		if token == "" {
 			return nil, E.New("tls-groups contains an empty group name")
 		}
-		curveID, found := tlsGroupAliases[token]
+		curveID, found := tlsGroupAliases[strings.ToUpper(token)]
 		if !found {
 			return nil, E.New("unsupported tls-groups name: ", token)
 		}
@@ -508,9 +509,6 @@ func parseTLSGroups(input string) ([]tls.CurveID, error) {
 		}
 		seen[curveID] = struct{}{}
 		curveIDs = append(curveIDs, curveID)
-	}
-	if len(curveIDs) == 0 {
-		return nil, E.New("tls-groups yielded no supported curves")
 	}
 	return curveIDs, nil
 }
