@@ -165,7 +165,7 @@ func buildTLSClientConfiguration(options ClientOptions) (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	tlsCipherSuites = applyCertificateProfileTLSCipherDefault(certProfile, tlsCipherSuites)
+	tlsCipherSuites, tlsCurvePreferences = applyCertificateProfileTLSDefaults(certProfile, tlsCipherSuites, tlsCurvePreferences)
 	verifier := &peerCertificateVerifier{options: peerCertificateVerifierOptions{
 		Roots:                    rootCAs,
 		Purpose:                  certificatePurposeSSLServer,
@@ -290,7 +290,7 @@ func buildTLSServerConfiguration(options ServerOptions) (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	tlsCipherSuites = applyCertificateProfileTLSCipherDefault(certProfile, tlsCipherSuites)
+	tlsCipherSuites, tlsCurvePreferences = applyCertificateProfileTLSDefaults(certProfile, tlsCipherSuites, tlsCurvePreferences)
 	verifier := &peerCertificateVerifier{options: peerCertificateVerifierOptions{
 		Roots:                    rootCAs,
 		Purpose:                  certificatePurposeSSLClient,
@@ -332,14 +332,22 @@ func buildTLSServerConfiguration(options ServerOptions) (*tls.Config, error) {
 	return tlsConfiguration, nil
 }
 
-func applyCertificateProfileTLSCipherDefault(profile string, cipherSuites []uint16) []uint16 {
-	if profile != "suiteb" || len(cipherSuites) > 0 {
-		return cipherSuites
+// Upstream tls_ctx_set_cert_profile selects OpenSSL SUITEB128 for suiteb,
+// which also limits the supported groups to P-256 and P-384.
+func applyCertificateProfileTLSDefaults(profile string, cipherSuites []uint16, curvePreferences []tls.CurveID) ([]uint16, []tls.CurveID) {
+	if profile != "suiteb" {
+		return cipherSuites, curvePreferences
 	}
-	return []uint16{
-		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+	if len(cipherSuites) == 0 {
+		cipherSuites = []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		}
 	}
+	if len(curvePreferences) == 0 {
+		curvePreferences = []tls.CurveID{tls.CurveP256, tls.CurveP384}
+	}
+	return cipherSuites, curvePreferences
 }
 
 type certificatePool struct {
